@@ -253,3 +253,85 @@ pip install -e .
 pip install pyarrow plotly
 # dashboard
 pip install streamlit
+
+
+
+## 4. Arborescence
+
+hyperstat-arb-bot/
+├─ README.md
+├─ pyproject.toml
+├─ .gitignore
+├─ .env.example
+├─ .streamlit/
+│  └─ config.toml                 # thème dark
+├─ configs/
+│  ├─ default.yaml
+│  ├─ hyperliquid_mainnet.yaml
+│  ├─ hyperliquid_testnet.yaml
+│  └─ strategy_stat_arb.yaml
+├─ apps/
+│  └─ dashboard.py                # Streamlit live UI (PNL/positions/risques)
+├─ src/
+│  └─ hyperstat/
+│     ├─ __init__.py
+│     ├─ main.py
+│     ├─ core/
+│     │  ├─ __init__.py
+│     │  ├─ clock.py
+│     │  ├─ logging.py
+│     │  ├─ types.py
+│     │  ├─ math.py
+│     │  └─ risk.py
+│     ├─ exchange/
+│     │  ├─ __init__.py
+│     │  ├─ sandbox.py
+│     │  └─ hyperliquid/
+│     │     ├─ __init__.py
+│     │     ├─ endpoints.py
+│     │     ├─ auth.py
+│     │     ├─ rest_client.py
+│     │     ├─ ws_client.py
+│     │     ├─ rate_limiter.py
+│     │     ├─ market_data.py
+│     │     ├─ funding.py
+│     │     └─ execution.py
+│     ├─ data/
+│     │  ├─ __init__.py
+│     │  ├─ storage.py
+│     │  ├─ loaders.py
+│     │  ├─ features.py
+│     │  └─ universe.py
+│     ├─ strategy/
+│     │  ├─ __init__.py
+│     │  ├─ stat_arb.py
+│     │  ├─ funding_overlay.py
+│     │  ├─ allocator.py
+│     │  └─ regime.py
+│     ├─ backtest/
+│     │  ├─ __init__.py
+│     │  ├─ engine.py
+│     │  ├─ costs.py
+│     │  ├─ metrics.py
+│     │  └─ reports.py
+│     ├─ live/
+│     │  ├─ __init__.py
+│     │  ├─ runner.py
+│     │  ├─ order_manager.py
+│     │  └─ health.py
+│     ├─ monitoring/
+│     │  ├─ __init__.py
+│     │  ├─ sink.py
+│     │  └─ risk_metrics.py
+│     └─ cli/
+│        ├─ __init__.py
+│        └─ commands.py
+├─ scripts/
+│  ├─ download_history.py
+│  ├─ build_universe.py
+│  └─ run_live.sh
+└─ tests/
+   ├─ test_projection_neutral.py
+   ├─ test_cost_model.py
+   └─ test_strategy_smoke.py
+
