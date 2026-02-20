@@ -1,0 +1,40 @@
+strategy:
+  name: stat_arb_cs_mr_with_funding_overlay
+
+  signal:
+    # Cross-sectional mean reversion (bucket)
+    horizon_bars: 12            # 12 * 5m = 1h
+    z_in: 1.5
+    z_out: 0.5
+    z_max: 3.0
+    min_hold_minutes: 30
+    max_hold_minutes: 1440
+
+  regime:
+    # Q_t = Q_MR * Q_LIQ * Q_RISK
+    mr:
+      ar1_window_days: 7
+      halflife_min_minutes: 30
+      halflife_good_max_minutes: 360     # 6h
+      halflife_ok_max_minutes: 1440      # 24h
+
+    risk:
+      vol_window_days: 1
+      high_vol_pctl: 0.90
+      extreme_vol_pctl: 0.95
+
+  funding_overlay:
+    enabled: true
+    ewma_lambda: 0.15
+    snr_gate_min: 0.5
+
+    # only recompute funding tilt when funding updates (reduces churn)
+    rebalance_on_funding_only: true
+
+    # mixing strength (start small)
+    eta: 0.10
+    gross_target: 0.20
+
+    break_even:
+      horizon_funding_periods: 3
+      buffer_bps: 5

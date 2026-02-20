@@ -1,0 +1,88 @@
+# Base config (common to backtest/paper/live)
+run:
+  mode: paper                  # backtest | paper | live
+  timezone: UTC
+  log_level: INFO
+  seed: 42
+
+exchange:
+  name: hyperliquid
+  network: testnet             # testnet | mainnet (overridden by env configs)
+  rest_url: https://api.hyperliquid-testnet.xyz
+  ws_url: wss://api.hyperliquid-testnet.xyz/ws
+
+  account:
+    address_env: HL_ADDRESS
+    private_key_env: HL_PRIVATE_KEY
+
+  limits:
+    # Hyperliquid REST weight limit is 1200/min; keep margin for safety
+    rest_weight_per_min: 1100
+    rest_timeout_s: 10
+    max_retries: 5
+    retry_backoff_s: [0.2, 0.5, 1.0, 2.0, 5.0]
+
+    # WS hard guards (Hyperliquid: 10 conns max, 1000 subs max)
+    max_ws_connections: 1
+    max_ws_subscriptions: 800
+    max_ws_messages_per_min: 1800
+
+data:
+  timeframe: 5m
+  quote_ccy: USDC
+  base_factor_symbol: BTC         # market factor for beta neutralization
+
+  storage:
+    backend: parquet              # parquet | duckdb | sqlite
+    root_dir: ./artifacts/data
+
+  history:
+    lookback_days_universe: 30
+    lookback_days_buckets: 30
+    rebucket_every_days: 7
+
+universe:
+  target_size: 30
+  min_history_days: 30
+  max_missing_ratio: 0.01
+
+  # proxies based on candles only
+  amihud_exclude_pct: 0.80
+  funding_vol_exclude_pct: 0.80
+
+  buckets:
+    k_min: 4
+    k_max: 6
+    min_bucket_size: 4
+    max_bucket_size: 10
+
+portfolio:
+  initial_equity_eur: 1500
+  # For live you’ll likely fund in USDC. You can convert later in code.
+  gross_target: 1.20
+  max_weight_per_coin: 0.12
+  max_weight_per_bucket: 0.35
+  dollar_neutral: true
+  beta_neutral: true
+
+execution:
+  mode: taker                    # taker | maker (start with taker-only)
+  # Backtest fill model (live ignores this)
+  fill_model: next_open          # next_open | mid (avoid mid for realism)
+
+  fees:
+    taker_bps: 6
+    maker_bps: 2
+
+  slippage:
+    # bps proxy: slip = base + k * RV_1h(%)
+    base_bps: 8
+    k_bps_per_1pct_rv1h: 10
+
+risk:
+  # portfolio kill-switch
+  max_intraday_drawdown_pct: 0.03
+  cooldown_minutes: 720
+
+  # per-coin emergency flatten
+  z_emergency_flat: 3.5

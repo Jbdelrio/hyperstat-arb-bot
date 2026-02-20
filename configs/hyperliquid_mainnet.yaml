@@ -1,0 +1,12 @@
+# Mainnet overrides
+exchange:
+  network: mainnet
+  rest_url: https://api.hyperliquid.xyz
+  ws_url: wss://api.hyperliquid.xyz/ws
+
+  limits:
+    # keep same safety margins unless you want to tune
+    rest_weight_per_min: 1100
+    max_ws_connections: 1
+    max_ws_subscriptions: 800
+    max_ws_messages_per_min: 1800
