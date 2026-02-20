@@ -68,16 +68,19 @@ Le stat-arb altcoins est dominé par :
 On cherche une opportunité de type “**dispersion mean-reverting**” au sein d’un bucket.
 
 Retour log sur horizon $H$ (ex: 1h en 5m → $H=12$) :
+
 $$
 R_{i,t}^{(H)}=\ln\left(\frac{P_{i,t}}{P_{i,t-H}}\right)
 $$
 
 Score robuste dans le bucket $B$ via **median/MAD** :
+
 $$
 z_{i,t}=\frac{R_{i,t}^{(H)}-\text{median}_B(R_t^{(H)})}{\text{MAD}_B(R_t^{(H)})+\varepsilon}
 $$
 
 Signal contrarian :
+
 $$
 s_{i,t}=-\text{clip}(z_{i,t},[-z_{max},z_{max}])
 $$
@@ -95,22 +98,26 @@ Objectif : limiter le **turnover** (sinon frais + slippage mangent l’alpha).
 
 Même si un z-score existe, ça ne veut pas dire que la MR est exploitable **maintenant**.
 On scale le risque via :
+
 $$
 Q_t = Q^{MR}_t \cdot Q^{liq}_t \cdot Q^{risk}_t \in [0,1]
 $$
 
 #### Mean reversion quality $Q^{MR}_t$
 On construit un spread bucket simple (top vs bottom quantiles) :
+
 $$
 S_{B,t}=\text{mean}_{Top}(R^{(H)}) - \text{mean}_{Bottom}(R^{(H)})
 $$
 
 Fit AR(1) rolling :
+
 $$
 S_{B,t}=a+bS_{B,t-1}+u_t
 $$
 
 Half-life (si $0<b<1$) :
+
 $$
 t_{1/2}=\frac{\ln 2}{-\ln b}\cdot \Delta t
 $$
@@ -134,12 +141,14 @@ Proxy via vol (BTC et/ou univers) :
 On transforme le signal en **target weights** $w_{i,t}$ (dimensionless : notional / equity).
 
 Vol-scaling :
+
 $$
 w^{raw}_{i,t}=\frac{s_{i,t}}{\hat{\sigma}_{i,t}}
 $$
 où $\hat{\sigma}$ est une vol EWMA.
 
 Application du régime :
+
 $$
 w_{i,t} \leftarrow Q_t \cdot w_{i,t}
 $$
@@ -149,6 +158,7 @@ $$
 - Beta-neutral (vs BTC) : $\sum_i w_i \beta_i = 0$
 
 On applique une projection dans l’espace admissible $A w=0$ :
+
 $$
 w \leftarrow \left(I - A^\top(AA^\top)^{-1}A\right)u
 $$
@@ -163,27 +173,32 @@ $$
 
 Le funding est un **carry** (paiement périodique).
 Avec un notional $N_i$ et un funding $f_i$ :
+
 $$
 \Pi^{fund}_i \approx -N_i \cdot f_i
 $$
 (en général, funding positif ⇒ **long pay short**, donc être short capture le carry).
 
 On calcule un “préférentiel” :
+
 $$
 u_i = -\mu^f_i
 $$
 où $\mu^f_i$ est un EWMA du funding, et une mesure de bruit (EWMA MAD) :
+
 $$
 \text{SNR}^f_i = \frac{|\mu^f_i|}{\text{MAD}^f_i+\varepsilon}
 $$
 
 **Break-even** (indispensable avec capital faible) :
+
 $$
 |\mu^f_i|\cdot H_{fund} \cdot 10^4 \;>\; C_{bps} + \text{buffer}
 $$
 où $C_{bps}$ approxime fees+slip.
 
 Ensuite on **projette** l’overlay pour rester dollar/beta neutral, et on combine :
+
 $$
 w^{final} = w^{stat} + \eta \cdot Q^{fund} \cdot w^{fund}
 $$
@@ -195,10 +210,12 @@ $$
 Backtest : modèle simple mais calibrable :
 - Fees bps (taker/maker)
 - Slippage bps proxy :
+
 $$
 \text{slip}_{bps} = s_0 + k \cdot RV_{1h}(\%) 
 $$
 Coût par rebal :
+
 $$
 \text{Cost}_t = \sum_i |\Delta w_{i,t}|\cdot Equity_t \cdot \frac{fee_{bps} + slip_{bps}}{10^4}
 $$
