@@ -38,3 +38,36 @@ strategy:
     break_even:
       horizon_funding_periods: 3
       buffer_bps: 5
+
+  # ── Funding Divergence Signal (FDS) ──────────────────────────────────────
+  # Multiplicative confidence gate applied between vol-scaling and caps.
+  # Formula: w_final_i = w_stat_i * (1 + gate_scale * FDS_i)
+  #
+  # Calibration order (walk-forward, fix others first):
+  #   1. divergence_window   12–48 bars
+  #   2. span_funding_fast    4–16 bars
+  #   3. w_carry / w_divergence / w_velocity
+  #   4. gate_scale
+  #
+  # Validation: run FDSDiagnostics.signal_ic() on real Hyperliquid data.
+  # IC > 0.03 with t-stat > 2 → signal is predictive → increase gate_scale.
+  funding_divergence_signal:
+    enabled: true
+
+    # EWMA spans (bars at your 5-min timeframe)
+    span_funding_fast: 8    # tau_f ≈ 40 min  — detects velocity
+    span_funding_slow: 72   # tau_s ≈ 6h      — captures carry level
+
+    # Rolling window for corr(return_z, Δfunding) — divergence component
+    divergence_window: 24   # W bars = 2h
+
+    # Component weights (must sum to 1)
+    w_carry:      0.35
+    w_divergence: 0.40      # the novel component — price/funding misalignment
+    w_velocity:   0.25
+
+    # Gate intensity — start conservative, increase if IC confirms signal
+    gate_scale: 0.6
+
+    # Warm-up: bars required before the signal activates (avoid cold-start noise)
+    min_obs: 48

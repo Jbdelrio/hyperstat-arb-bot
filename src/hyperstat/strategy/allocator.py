@@ -10,6 +10,7 @@ from hyperstat.core.math import neutralize_weights, normalize_to_gross
 from hyperstat.core.risk import apply_bucket_caps, apply_weight_caps, emergency_flatten_by_z
 from hyperstat.core.types import PortfolioWeights, RegimeScore, Signal
 from .funding_overlay import FundingOverlayModel
+from .funding_divergence_signal import FundingDivergenceSignalLive
 
 
 @dataclass(frozen=True)
@@ -39,9 +40,15 @@ class AllocatorConfig:
 
 
 class PortfolioAllocator:
-    def __init__(self, cfg: AllocatorConfig, funding_overlay: Optional[FundingOverlayModel] = None) -> None:
+    def __init__(
+        self,
+        cfg: AllocatorConfig,
+        funding_overlay: Optional[FundingOverlayModel] = None,
+        fds: Optional[FundingDivergenceSignalLive] = None,
+    ) -> None:
         self.cfg = cfg
         self.funding_overlay = funding_overlay
+        self.fds = fds  # Funding Divergence Signal gate (optional)
 
     def allocate(
         self,
@@ -51,10 +58,14 @@ class PortfolioAllocator:
         buckets: Dict[str, List[str]],
         features: Dict[str, Dict[str, float]],
         betas: Optional[Dict[str, float]] = None,
+        funding_rates: Optional[Dict[str, float]] = None,
     ) -> PortfolioWeights:
         """
         features expected keys per symbol (best-effort):
           - ewma_vol OR vol (used for scaling)
+
+        funding_rates: raw per-symbol funding rates at current bar, required for
+          the FDS gate. If None, the FDS gate is skipped even if self.fds is set.
         """
         symbols = list(signal.weights_raw.keys())
 
@@ -76,6 +87,17 @@ class PortfolioAllocator:
         # --- 3) neutralize + normalize stat layer gross
         w = neutralize_weights(w, betas=betas, dollar_neutral=self.cfg.dollar_neutral, beta_neutral=self.cfg.beta_neutral)
         w = normalize_to_gross(w, gross_target=float(self.cfg.gross_target_stat))
+
+        # --- 3.5) FDS multiplicative confidence gate
+        # w_final_i = w_stat_i * (1 + gate_scale * FDS_i)
+        # Applied before caps so the gate modulates position size, not the caps.
+        # Re-neutralize after the gate because it breaks dollar/beta neutrality.
+        fds_scores: Dict[str, float] = {}
+        if self.fds is not None and funding_rates is not None:
+            fds_scores = self.fds.update_and_compute(signal.zscores, funding_rates)
+            w = self.fds.apply_gate(w, fds_scores)
+            w = neutralize_weights(w, betas=betas, dollar_neutral=self.cfg.dollar_neutral, beta_neutral=self.cfg.beta_neutral)
+            w = normalize_to_gross(w, gross_target=float(self.cfg.gross_target_stat))
 
         # --- 4) apply caps (coin then bucket) + re-normalize stat layer
         w = apply_weight_caps(w, max_weight_per_coin=float(self.cfg.max_weight_per_coin), gross_target=None)
@@ -130,6 +152,8 @@ class PortfolioAllocator:
         if betas is not None:
             beta = float(sum(w_total[s] * float(betas.get(s, 0.0)) for s in w_total))
 
+        fds_mean = float(np.mean(list(fds_scores.values()))) if fds_scores else 0.0
+        fds_active_count = int(sum(1 for v in fds_scores.values() if v != 0.0))
         meta = {
             "q_total": float(regime.q_total),
             "q_mr": float(regime.q_mr),
@@ -138,6 +162,8 @@ class PortfolioAllocator:
             "q_fund": float(q_fund),
             "gross_stat_target": float(self.cfg.gross_target_stat),
             "gross_cap_total": float(gross_cap),
+            "fds_mean": fds_mean,
+            "fds_active_coins": float(fds_active_count),
         }
 
         return PortfolioWeights(ts=ts, weights=w_total, gross=gross, net=net, beta=beta, meta=meta)
