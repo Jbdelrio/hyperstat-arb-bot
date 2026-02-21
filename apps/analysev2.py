@@ -272,7 +272,8 @@ def load_data(data_dir: str, tf: str):
 
 @st.cache_data(show_spinner=False)
 def run_full_backtest(
-    _candles_pkl, _funding_pkl, _coins, _buckets_raw,
+    _candles_pkl, _funding_pkl, coins, buckets_raw,
+    d_start, d_end,
     initial_equity, gross_target, max_w_coin, max_w_bucket,
     dollar_neutral, beta_neutral,
     z_in, z_out, z_max, horizon_bars, tf_min,
@@ -288,13 +289,13 @@ def run_full_backtest(
             d[k]["ts"] = pd.to_datetime(d[k]["ts"], utc=True, errors="coerce")
 
     buckets = {}
-    for b in _buckets_raw:
+    for b in buckets_raw:
         bname, syms = b
         buckets[bname] = [s for s in syms if s in candles]
 
     buckets = {k: v for k, v in buckets.items() if len(v) >= 3}
     if not buckets:
-        buckets = {"all": [c for c in _coins if c in candles]}
+        buckets = {"all": [c for c in coins if c in candles]}
 
     cfg = {
         "data": {"timeframe": f"{tf_min}m", "base_factor_symbol": "BTC"},
@@ -317,8 +318,8 @@ def run_full_backtest(
 
     report = run_backtest(
         cfg=cfg,
-        candles_by_symbol={c: candles[c] for c in _coins if c in candles},
-        funding_by_symbol={c: funding[c] for c in _coins if c in funding},
+        candles_by_symbol={c: candles[c] for c in coins if c in candles},
+        funding_by_symbol={c: funding[c] for c in coins if c in funding},
         buckets=buckets,
         stat_arb=StatArbStrategy(StatArbConfig(
             timeframe_minutes=tf_min, horizon_bars=horizon_bars,
@@ -338,7 +339,7 @@ def run_full_backtest(
 
 
 @st.cache_data(show_spinner=False)
-def compute_fds_analysis(_candles, _funding, coins, tf_min, fds_params):
+def compute_fds_analysis(_candles, _funding, coins, tf_min, fds_params, d_start, d_end):
     """
     Calcule le FDS sur données réelles et retourne les DataFrames
     nécessaires pour la validation IC et la décomposition des composantes.
@@ -807,9 +808,11 @@ with tab_fds:
         gate_df, ic_series, breakdown_df, returns_df, funding_df = compute_fds_analysis(
             _candles=candles_f,
             _funding=funding_f,
-            coins=coins_with_funding,
+            coins=tuple(coins_with_funding),
             tf_min=tf_min,
             fds_params=fds_params,
+            d_start=str(d_start),
+            d_end=str(d_end),
         )
 
     if gate_df is None:
@@ -821,10 +824,10 @@ with tab_fds:
     # ── KPIs IC ─────────────────────────────────────────────────────────────
     section("Information Coefficient (IC) — résumé")
 
-    ic_mean  = float(ic_clean.mean()) if len(ic_clean) > 0 else float("nan")
-    ic_std   = float(ic_clean.std())  if len(ic_clean) > 1 else float("nan")
-    ic_tstat = ic_mean / (ic_std / np.sqrt(len(ic_clean))) if ic_std > 0 else float("nan")
-    ic_pos_pct = float((ic_clean > 0).mean()) * 100
+    ic_mean    = float(ic_clean.mean()) if len(ic_clean) > 0 else float("nan")
+    ic_std     = float(ic_clean.std())  if len(ic_clean) > 1 else float("nan")
+    ic_tstat   = ic_mean / (ic_std / np.sqrt(len(ic_clean))) if (ic_std and ic_std > 0) else float("nan")
+    ic_pos_pct = float((ic_clean > 0).mean()) * 100 if len(ic_clean) > 0 else float("nan")
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -982,7 +985,9 @@ with tab_backtest:
             try:
                 report, buckets_used = run_full_backtest(
                     _candles_pkl=candles_f, _funding_pkl=funding_f,
-                    _coins=tuple(coins_sel), _buckets_raw=tuple(buckets_raw),
+                    coins=tuple(coins_sel),
+                    buckets_raw=tuple((b[0], tuple(b[1])) for b in buckets_raw),
+                    d_start=str(d_start), d_end=str(d_end),
                     initial_equity=initial_equity, gross_target=gross_target,
                     max_w_coin=max_w_coin, max_w_bucket=max_w_bucket,
                     dollar_neutral=dollar_neutral, beta_neutral=beta_neutral,

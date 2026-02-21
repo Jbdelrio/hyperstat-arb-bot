@@ -451,12 +451,13 @@ class FDSDiagnostics:
         gate = self.fds.compute(returns_df, funding_df)
         fwd = returns_df.shift(-forward_horizon)
 
+        min_coins = max(3, len(returns_df.columns) // 2)
         ics = []
         for t in gate.index:
             g = gate.loc[t]
             r = fwd.loc[t]
             mask = g.notna() & r.notna()
-            if mask.sum() < 5:
+            if mask.sum() < min_coins:
                 ics.append(float("nan"))
             else:
                 ic, _ = spearmanr(g[mask].values, r[mask].values)
