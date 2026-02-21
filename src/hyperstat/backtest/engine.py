@@ -70,7 +70,8 @@ def _timeline(candles_by_symbol: Dict[str, pd.DataFrame]) -> pd.DatetimeIndex:
             idxs.append(pd.DatetimeIndex(df["ts"]))
     if not idxs:
         return pd.DatetimeIndex([], tz="UTC")
-    idx = idxs[0].union_many(idxs[1:]).sort_values()
+    from functools import reduce
+    idx = reduce(lambda a, b: a.union(b), idxs).sort_values()
     idx = pd.DatetimeIndex(pd.to_datetime(idx, utc=True, errors="coerce")).dropna()
     return idx
 
