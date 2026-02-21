@@ -88,7 +88,7 @@ pip install -e .
 pip install pyarrow plotly
 
 
-
+Points à parler à Clause
  D'abord j'aimerais savoir deux trois élements avant : 
 
 
@@ -98,3 +98,7 @@ pip install pyarrow plotly
 
 
 2) Il serait interessant de choisir ces atlcoins auxquels on peut extraitres les données par des features (par exemple les altcoins avec un funding horaire peut etre interessant puisqu'il represente pas mal de mouvement, minimu de market capt pour éviter une illiquider total, ici 
+
+
+- Lorsque dans mon streamlit je veux changer des coins (rajouter ou supprimer celui-ci me mets des results nan pour sgnaux z-score, FDS validation et backtest
+

@@ -38,7 +38,7 @@ Le projet est conçu pour :
 
 **Filtrage univers** :
 - Dollar volume proxy : $DV_{i,t} = P_{i,t} \cdot V_{i,t}$
-- Illiquidité d'Amihud : $ILLIQ_i = \text{median}_t\!\left(\frac{|r_{i,t}|}{DV_{i,t}+\varepsilon}\right)$
+- Illiquidité d'Amihud : $ILLIQ_{i} = \text{median}_t\!\left(\frac{|r_{i,t}|}{DV_{i,t}+\varepsilon}\right)$
 - Exclusion des coins à funding instable (toxiques pour le carry)
 
 **Buckets** — regroupement des coins structurellement similaires pour capter la dispersion intra-groupe :

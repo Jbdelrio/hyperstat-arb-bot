@@ -129,12 +129,29 @@ def compute_equity_metrics(equity_df: pd.DataFrame, window: int = 2000) -> Dict[
     last_equity = float(eq.iloc[-1])
     ret_total = float(eq.iloc[-1] / eq.iloc[0] - 1.0)
 
+    # Sortino (downside vol seulement)
+    neg_r = r_win[r_win < 0]
+    if not neg_r.empty:
+        down_vol = float(neg_r.std(ddof=1) * np.sqrt(steps_per_year))
+        sortino = float(ann_return / down_vol) if down_vol > 1e-12 else float("nan")
+    else:
+        sortino = float("nan")
+
+    # Calmar = CAGR / |max drawdown|
+    calmar = float(ann_return / abs(max_dd)) if abs(max_dd) > 1e-12 else float("nan")
+
+    # Win rate (fraction des barres positives)
+    win_rate = float((r_win > 0).mean())
+
     return {
         "equity": last_equity,
         "total_return": ret_total,
         "ann_return": ann_return,
         "ann_vol": ann_vol,
         "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": calmar,
+        "win_rate": win_rate,
         "max_drawdown": max_dd,
         "steps_per_year": float(steps_per_year),
     }
