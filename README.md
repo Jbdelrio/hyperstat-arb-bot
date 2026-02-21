@@ -44,7 +44,9 @@ Le projet est conçu pour :
 **Buckets** — regroupement des coins structurellement similaires pour capter la dispersion intra-groupe :
 
 Distance corrélation sur résidus BTC-neutralisés :
+
 $$r_{i,t} = \beta_i r_{BTC,t} + \varepsilon_{i,t}$$
+
 $$d_{ij}=\sqrt{\tfrac{1}{2}(1-\rho_{ij}^{\varepsilon})}$$
 
 Clustering hiérarchique → $K$ buckets (4–6 dans la config par défaut).
@@ -54,12 +56,15 @@ Clustering hiérarchique → $K$ buckets (4–6 dans la config par défaut).
 ### 1.2 Signal Mean-Reversion Cross-Sectionnel
 
 Log-return sur horizon $H$ (ex: 12 barres × 5m = 1h) :
+
 $$R_{i,t}^{(H)}=\ln\!\left(\frac{P_{i,t}}{P_{i,t-H}}\right)$$
 
 Z-score robuste intra-bucket $B$ via **median/MAD** :
+
 $$z_{i,t}=\frac{R_{i,t}^{(H)}-\text{median}_B(R_t^{(H)})}{\text{MAD}_B(R_t^{(H)})+\varepsilon}$$
 
 Signal contrarian avec hystérésis anti-churn :
+
 $$s_{i,t}=-\text{clip}(z_{i,t},[-z_{max},z_{max}])$$
 
 **Règles d'hystérésis** :
@@ -76,7 +81,9 @@ $$Q_t = Q^{MR}_t \cdot Q^{liq}_t \cdot Q^{risk}_t \in [0,1]$$
 #### $Q^{MR}_t$ — Mean reversion quality
 
 Spread bucket top/bottom quantiles → AR(1) rolling :
+
 $$S_{B,t}=a+b \cdot S_{B,t-1}+u_t$$
+
 $$t_{1/2}=\frac{\ln 2}{-\ln b}\cdot \Delta t$$
 
 | Half-life | $Q^{MR}$ |
@@ -107,6 +114,7 @@ Percentiles rolling sur 60 jours :
 > **Insight clé :** sur Hyperliquid, les traders on-chain ont un biais structurel **long**, créant une asymétrie persistante dans le funding. L'alpha vient de combiner trois dimensions que la littérature ne croise pas.
 
 Le FDS est appliqué comme un **gate de confiance multiplicatif** entre le vol-scaling et les caps :
+
 $$\boxed{w_{i,t}^{after\,FDS} = w_{i,t}^{stat} \cdot \left(1 + \alpha_{fds} \cdot \text{FDS}_{i,t}\right)}$$
 
 avec $\alpha_{fds} = 0.6$ (configurable). Si $\text{FDS} = 0$ → identité. Si $\text{FDS} > 0$ → renforce le pari contrarian. Si $\text{FDS} < 0$ → atténue.
@@ -114,7 +122,9 @@ avec $\alpha_{fds} = 0.6$ (configurable). Si $\text{FDS} = 0$ → identité. Si 
 #### Composante 1 — Carry cross-sectionnel (poids 0.35)
 
 EWMA lente du funding (span $\tau_s = 72$ barres) puis z-score cross-sectionnel robuste :
+
 $$\tilde{f}_{i,t}^{slow} = \text{EWMA}_{\tau_s}(f_{i,t})$$
+
 $$s^{carry}_{i,t} = -\text{clip}\!\left(\frac{\tilde{f}_{i,t}^{slow} - \text{median}_j(\tilde{f}_{j,t}^{slow})}{\text{MAD}_j + \varepsilon},\ [-z_{max}, z_{max}]\right)$$
 
 Signe négatif : funding élevé $\Rightarrow$ longs overcrowdés $\Rightarrow$ signal short contrarian.
@@ -124,15 +134,19 @@ Signe négatif : funding élevé $\Rightarrow$ longs overcrowdés $\Rightarrow$ 
 C'est la composante originale. On mesure la **tension** entre direction des prix et direction du funding :
 
 Vélocité du funding (EWMA rapide, span $\tau_f = 8$ barres) :
+
 $$\Delta\tilde{f}_{i,t}^{fast} = \text{EWMA}_{\tau_f}(f_{i,t}) - \text{EWMA}_{\tau_f}(f_{i,t-1})$$
 
 Corrélation rolling sur fenêtre $W = 24$ barres :
+
 $$\rho_{i,t} = \text{Corr}_W\!\left(z_{i,t}^{return},\ \Delta\tilde{f}_{i,t}^{fast}\right)$$
 
 Tension maximale quand $\rho \approx 0$ (signaux contradictoires) :
+
 $$\text{tension}_{i,t} = 1 - |\rho_{i,t}| \in [0, 1]$$
 
 Signe de la divergence :
+
 $$\text{sign}_{i,t} = -\text{sgn}(z_{i,t}^{return}) \cdot \text{sgn}(\Delta\tilde{f}_{i,t}^{fast})$$
 
 $$s^{div}_{i,t} = \text{clip}\!\left(\text{sign}_{i,t} \cdot \text{tension}_{i,t},\ [-1, 1]\right)$$
@@ -142,6 +156,7 @@ $$s^{div}_{i,t} = \text{clip}\!\left(\text{sign}_{i,t} \cdot \text{tension}_{i,t
 #### Composante 3 — Vélocité du funding (poids 0.25)
 
 Ratio fast/slow = mesure de l'accélération :
+
 $$v_{i,t} = \frac{\text{EWMA}_{\tau_f}(f_{i,t}) - \text{EWMA}_{\tau_s}(f_{i,t})}{|\text{EWMA}_{\tau_s}(f_{i,t})| + \varepsilon}$$
 
 $$s^{vel}_{i,t} = -\text{clip}\!\left(\frac{v_{i,t}}{v_{max}},\ [-1, 1]\right)$$
@@ -153,6 +168,7 @@ Funding qui accélère vers le haut → longs overcrowdés → signal short (con
 $$\text{FDS}_{i,t}^{raw} = 0.35 \cdot s^{carry}_{i,t} + 0.40 \cdot s^{div}_{i,t} + 0.25 \cdot s^{vel}_{i,t}$$
 
 Normalisation cross-sectionnel finale :
+
 $$\text{FDS}_{i,t} = \text{clip}\!\left(\frac{\text{FDS}_{i,t}^{raw} - \text{median}_j(\text{FDS}_{j,t}^{raw})}{2 \cdot \text{MAD}_j + \varepsilon},\ [-1, 1]\right)$$
 
 Implémentation : `src/hyperstat/strategy/funding_divergence_signal.py`
@@ -167,6 +183,7 @@ Implémentation : `src/hyperstat/strategy/funding_divergence_signal.py`
 Pipeline complet dans `allocator.py` :
 
 **1. Vol-scaling** :
+
 $$w_{i,t}^{raw} = \frac{s_{i,t}}{\hat{\sigma}_{i,t}} \quad \text{(EWMA vol)}$$
 
 **2. Regime scaling** : $w \leftarrow Q_t \cdot w$
@@ -174,12 +191,15 @@ $$w_{i,t}^{raw} = \frac{s_{i,t}}{\hat{\sigma}_{i,t}} \quad \text{(EWMA vol)}$$
 **3. Neutralisation + normalisation gross** :
 
 Projection dans le nullspace des contraintes $Aw = 0$ :
+
 $$w \leftarrow \left(I - A^\top(AA^\top)^{-1}A\right)w$$
 
 avec $A$ encodant dollar-neutral ($\sum w_i = 0$) et beta-neutral ($\sum w_i \beta_i = 0$).
 
 **3.5. FDS gate** (entre vol-scaling et caps) :
+
 $$w_i \leftarrow w_i \cdot (1 + \alpha_{fds} \cdot \text{FDS}_i)$$
+
 Suivi d'une **re-neutralisation obligatoire** (le gate casse la neutralité).
 
 **4. Caps** :
@@ -197,15 +217,19 @@ Suivi d'une **re-neutralisation obligatoire** (le gate casse la neutralité).
 ### 1.6 Funding Carry Overlay
 
 Le funding est un carry périodique. Avec notional $N_i$ et funding $f_i$ :
+
 $$\Pi^{fund}_i \approx -N_i \cdot f_i$$
 
 EWMA du funding + MAD pour le bruit :
+
 $$u_i = -\mu^f_i, \quad \text{SNR}^f_i = \frac{|\mu^f_i|}{\text{MAD}^f_i + \varepsilon}$$
 
 Break-even avant inclusion :
+
 $$|\mu^f_i| \cdot H_{fund} \cdot 10^4 > C_{bps} + \text{buffer}$$
 
 Overlay projeté dollar/beta neutral, combiné :
+
 $$w^{final} = w^{stat} + \eta \cdot Q^{fund} \cdot w^{fund}$$
 
 ---
@@ -213,9 +237,11 @@ $$w^{final} = w^{stat} + \eta \cdot Q^{fund} \cdot w^{fund}$$
 ### 1.7 Coûts & Réalisme
 
 Slippage proxy vol-dépendant :
+
 $$\text{slip}_{bps} = 8 + 10 \cdot RV_{1h}(\%)$$
 
 Coût par rebalancement :
+
 $$\text{Cost}_t = \sum_i |\Delta w_{i,t}| \cdot \text{Equity}_t \cdot \frac{\text{fee}_{bps} + \text{slip}_{bps}}{10^4}$$
 
 Paramètres par défaut (mode taker) : fee = 6 bps, slip base = 8 bps.
