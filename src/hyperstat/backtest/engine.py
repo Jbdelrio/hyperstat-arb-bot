@@ -364,6 +364,10 @@ class BacktestEngine:
                     meta={"cooldown_minutes": str(self.risk_state.cooldown_remaining_minutes(ts.to_pydatetime()))},
                 )
             else:
+                # Bug 2 fix: pass current funding rates so FDS gate is active.
+                # funding_events[ts] may be empty between funding ticks — that's fine,
+                # the FDS live state retains its EWMA from the last known funding tick.
+                funding_at_ts = self.funding_events.get(ts, {}) or None
                 target = self.allocator.allocate(
                     ts=ts.to_pydatetime(),
                     signal=signal,
@@ -371,6 +375,7 @@ class BacktestEngine:
                     buckets=self.buckets,
                     features=features,
                     betas=betas,
+                    funding_rates=funding_at_ts,
                 )
 
             # --- 6) compute turnover + trading costs for rebalance
@@ -484,6 +489,32 @@ def backtest_config_from_config(cfg: dict) -> BacktestConfig:
     )
 
 
+def _fds_from_config(cfg: dict):
+    """
+    Bug 4 fix: read strategy.funding_divergence_signal from YAML dict and
+    return a configured FundingDivergenceSignalLive, or None if disabled.
+    """
+    from hyperstat.strategy.funding_divergence_signal import FundingDivergenceSignalLive, FDSConfig
+
+    strategy = cfg.get("strategy", {}) or {}
+    fds_cfg_dict = strategy.get("funding_divergence_signal", {}) or {}
+
+    if not fds_cfg_dict.get("enabled", True):
+        return None
+
+    fds_config = FDSConfig(
+        span_funding_fast=int(fds_cfg_dict.get("span_funding_fast", 8)),
+        span_funding_slow=int(fds_cfg_dict.get("span_funding_slow", 72)),
+        divergence_window=int(fds_cfg_dict.get("divergence_window", 24)),
+        w_carry=float(fds_cfg_dict.get("w_carry", 0.35)),
+        w_divergence=float(fds_cfg_dict.get("w_divergence", 0.40)),
+        w_velocity=float(fds_cfg_dict.get("w_velocity", 0.25)),
+        gate_scale=float(fds_cfg_dict.get("gate_scale", 0.6)),
+        min_obs=int(fds_cfg_dict.get("min_obs", 48)),
+    )
+    return FundingDivergenceSignalLive(fds_config)
+
+
 def run_backtest(
     cfg: dict,
     candles_by_symbol: Dict[str, pd.DataFrame],
@@ -503,6 +534,14 @@ def run_backtest(
         cooldown_minutes=int(risk.get("cooldown_minutes", 720)),
         z_emergency_flat=float(risk.get("z_emergency_flat", 3.5)),
     )
+
+    # Bug 4 fix: if the allocator has no FDS wired yet AND the YAML enables it,
+    # inject the FDS from config. Allows using run_backtest() directly from a YAML
+    # config without having to manually build FundingDivergenceSignalLive.
+    if allocator.fds is None:
+        fds_from_yaml = _fds_from_config(cfg)
+        if fds_from_yaml is not None:
+            allocator.fds = fds_from_yaml
 
     eng = BacktestEngine(
         cfg=bt_cfg,

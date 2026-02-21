@@ -1,0 +1,100 @@
+hyperstat-arb-bot/
+├─ README.md
+├─ pyproject.toml
+├─ .gitignore
+├─ .env.example
+├─ .streamlit/
+│  └─ config.toml                 # thème dark
+├─ configs/
+│  ├─ default.yaml
+│  ├─ hyperliquid_mainnet.yaml
+│  ├─ hyperliquid_testnet.yaml
+│  └─ strategy_stat_arb.yaml
+├─ apps/
+│  └─ dashboard.py                # Streamlit live UI (PNL/positions/risques)
+├─ src/
+│  └─ hyperstat/
+│     ├─ __init__.py
+│     ├─ main.py
+│     ├─ core/
+│     │  ├─ __init__.py
+│     │  ├─ clock.py
+│     │  ├─ logging.py
+│     │  ├─ types.py
+│     │  ├─ math.py
+│     │  └─ risk.py
+│     ├─ exchange/
+│     │  ├─ __init__.py
+│     │  ├─ sandbox.py
+│     │  └─ hyperliquid/
+│     │     ├─ __init__.py
+│     │     ├─ endpoints.py
+│     │     ├─ auth.py
+│     │     ├─ rest_client.py
+│     │     ├─ ws_client.py
+│     │     ├─ rate_limiter.py
+│     │     ├─ market_data.py
+│     │     ├─ funding.py
+│     │     └─ execution.py
+│     ├─ data/
+│     │  ├─ __init__.py
+│     │  ├─ storage.py
+│     │  ├─ loaders.py
+│     │  ├─ features.py
+│     │  └─ universe.py
+│     ├─ strategy/
+│     │  ├─ __init__.py
+│     │  ├─ stat_arb.py
+│     │  ├─ funding_overlay.py
+│     │  ├─ allocator.py
+│     │  └─ regime.py
+│     ├─ backtest/
+│     │  ├─ __init__.py
+│     │  ├─ engine.py
+│     │  ├─ costs.py
+│     │  ├─ metrics.py
+│     │  └─ reports.py
+│     ├─ live/
+│     │  ├─ __init__.py
+│     │  ├─ runner.py
+│     │  ├─ order_manager.py
+│     │  └─ health.py
+│     ├─ monitoring/
+│     │  ├─ __init__.py
+│     │  ├─ sink.py
+│     │  └─ risk_metrics.py
+│     └─ cli/
+│        ├─ __init__.py
+│        └─ commands.py
+├─ scripts/
+│  ├─ download_history.py
+│  ├─ build_universe.py
+│  └─ run_live.sh
+└─ tests/
+   ├─ test_projection_neutral.py
+   ├─ test_cost_model.py
+   └─ test_strategy_smoke.py
+
+
+
+Just un truc si j'ai envie de fair eune interface TAP, streamlit fonds noir pour voir l'évolution de mon PNL et toutes mes positions , les métriques de risques en live VaR, Corr, Mean return sharpe ratio, PNL with fees, other metrics 
+
+
+
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+# optionnel mais recommandé pour parquet + charts
+pip install pyarrow plotly
+
+
+
+ D'abord j'aimerais savoir deux trois élements avant : 
+
+
+
+1) Deja ca serait bien que la clef privée pour hyperliquid on puisse soit l'integrer dans  le streamlit en tant que input en live ou dans le CMD afiin que n'importe qui puisse l'adapter et quelle reste privée.
+
+
+
+2) Il serait interessant de choisir ces atlcoins auxquels on peut extraitres les données par des features (par exemple les altcoins avec un funding horaire peut etre interessant puisqu'il represente pas mal de mouvement, minimu de market capt pour éviter une illiquider total, ici 
