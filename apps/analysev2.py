@@ -341,17 +341,20 @@ def run_full_backtest(
 @st.cache_data(show_spinner=False)
 def compute_fds_analysis(_candles, _funding, coins, tf_min, fds_params, d_start, d_end):
     """
-    Calcule le FDS sur données réelles et retourne les DataFrames
-    nécessaires pour la validation IC et la décomposition des composantes.
+    Calcule le FDS sur données réelles à la fréquence du funding (8h).
+
+    Pourquoi 8h ? Le funding est publié toutes les 8h. Calculer le FDS à 5m
+    avec un funding ffill'd produit delta_f ≈ 0 pendant 95/96 barres →
+    le signal de divergence est indéfini → gate tout zéros → IC = NaN.
 
     Retourne:
-        gate_df        : DataFrame (T, N) du signal FDS ∈ [-1, 1]
-        ic_series      : Series de l'IC de Spearman par timestamp
+        gate_df        : DataFrame (T_8h, N) du signal FDS ∈ [-1, 1]
+        ic_series      : Series de l'IC de Spearman à chaque tick 8h
         breakdown_df   : DataFrame des 3 composantes moyennées
-        returns_df     : DataFrame des log-returns
-        funding_df     : DataFrame des funding rates
+        returns_df     : DataFrame des log-returns 8h
+        funding_df     : DataFrame des funding rates 8h
     """
-    # ── Aligner les returns sur un index commun ─────────────────────────────
+    # ── Prix de clôture 5m → résumé 8h ──────────────────────────────────────
     close_dict = {}
     for c in coins:
         df = _candles.get(c)
@@ -364,10 +367,12 @@ def compute_fds_analysis(_candles, _funding, coins, tf_min, fds_params, d_start,
     if len(close_dict) < 3:
         return None, None, None, None, None
 
-    close_df = pd.DataFrame(close_dict).sort_index().ffill()
-    returns_df = np.log(close_df / close_df.shift(1)).dropna(how="all")
+    close_5m = pd.DataFrame(close_dict).sort_index().ffill()
+    # Resample au tick funding (8h) : dernier close de chaque période
+    close_8h  = close_5m.resample("8h").last().ffill().dropna(how="all")
+    returns_df = np.log(close_8h / close_8h.shift(1)).dropna(how="all")
 
-    # ── Aligner les funding rates ───────────────────────────────────────────
+    # ── Funding rates à leur fréquence native (8h) ───────────────────────────
     fund_dict = {}
     for c in coins:
         df = _funding.get(c)
@@ -380,35 +385,50 @@ def compute_fds_analysis(_candles, _funding, coins, tf_min, fds_params, d_start,
     if len(fund_dict) < 3:
         return None, None, None, None, None
 
-    # Resampler le funding sur le même index que les returns (ffill entre ticks)
-    fund_raw = pd.DataFrame(fund_dict).reindex(returns_df.index, method="ffill")
-    funding_df = fund_raw[returns_df.columns.intersection(fund_raw.columns)]
+    fund_8h = pd.DataFrame(fund_dict).sort_index()
+    # Aligner le funding sur l'index 8h des returns
+    funding_df = fund_8h.reindex(returns_df.index, method="ffill")
+    funding_df = funding_df[returns_df.columns.intersection(funding_df.columns)]
 
     # Garder seulement les coins présents dans les deux
     common = returns_df.columns.intersection(funding_df.columns).tolist()
     if len(common) < 3:
         return None, None, None, None, None
 
-    returns_df = returns_df[common]
-    funding_df = funding_df[common]
+    returns_df = returns_df[common].dropna(how="all")
+    funding_df = funding_df[common].reindex(returns_df.index, method="ffill")
 
-    # ── Calcul FDS batch ────────────────────────────────────────────────────
+    # Supprimer les lignes avec trop peu de coins valides
+    valid_rows = returns_df.notna().sum(axis=1) >= 3
+    returns_df = returns_df[valid_rows]
+    funding_df = funding_df.loc[returns_df.index]
+
+    if len(returns_df) < 20:
+        return None, None, None, None, None
+
+    # ── Adapter les paramètres FDS en barres 8h ──────────────────────────────
+    # Les sliders sont en "barres" — 1 barre 8h = bars_per_8h barres tf_min
+    bars_per_8h = max(1, 480 // tf_min)   # ex: 96 pour 5m, 8 pour 1h
+    def _scale(v, minimum=2):
+        return max(minimum, int(v) // bars_per_8h)
+
     cfg = FDSConfig(
-        span_funding_fast=int(fds_params["span_fast"]),
-        span_funding_slow=int(fds_params["span_slow"]),
-        divergence_window=int(fds_params["div_window"]),
+        span_funding_fast=_scale(fds_params["span_fast"], 2),
+        span_funding_slow=_scale(fds_params["span_slow"], 4),
+        divergence_window=_scale(fds_params["div_window"], 4),
         w_carry=float(fds_params["w_carry"]),
         w_divergence=float(fds_params["w_div"]),
         w_velocity=float(fds_params["w_vel"]),
         gate_scale=float(fds_params["gate_scale"]),
-        min_obs=int(fds_params["min_obs"]),
+        min_obs=_scale(fds_params["min_obs"], 4),
     )
-    fds = FundingDivergenceSignal(cfg)
+    fwd_8h = max(1, int(fds_params["fwd_horizon"]) // bars_per_8h)
+
+    fds  = FundingDivergenceSignal(cfg)
     diag = FDSDiagnostics(fds)
 
     gate_df      = fds.compute(returns_df, funding_df)
-    ic_series    = diag.signal_ic(returns_df, funding_df,
-                                  forward_horizon=int(fds_params["fwd_horizon"]))
+    ic_series    = diag.signal_ic(returns_df, funding_df, forward_horizon=fwd_8h)
     breakdown_df = diag.component_breakdown(returns_df, funding_df)
 
     return gate_df, ic_series, breakdown_df, returns_df, funding_df
@@ -794,7 +814,9 @@ with tab_fds:
     🧠 <b>Funding Divergence Signal (FDS)</b> — validation sur données réelles Hyperliquid.<br>
     L'<b>IC (Information Coefficient)</b> mesure la corrélation de Spearman entre le signal FDS calculé
     à l'instant <i>t</i> et les returns réels qui arrivent à <i>t + H</i>.
-    Un IC moyen > 0.03 avec t-stat > 2 confirme que le signal est prédictif et mérite d'être activé.
+    Un IC moyen > 0.03 avec t-stat > 2 confirme que le signal est prédictif et mérite d'être activé.<br>
+    <b>Note :</b> Le FDS est calculé à la fréquence du funding (<b>8h</b>) — les paramètres sidebar
+    (span_fast, span_slow, min_obs…) sont convertis automatiquement en barres 8h.
     </div>
     """, unsafe_allow_html=True)
 

@@ -459,9 +459,15 @@ class FDSDiagnostics:
             mask = g.notna() & r.notna()
             if mask.sum() < min_coins:
                 ics.append(float("nan"))
-            else:
-                ic, _ = spearmanr(g[mask].values, r[mask].values)
-                ics.append(float(ic))
+                continue
+            g_vals = g[mask].values
+            r_vals = r[mask].values
+            # Skip if gate is constant (cold-start zeros → Spearman undefined)
+            if np.std(g_vals) < 1e-8:
+                ics.append(float("nan"))
+                continue
+            ic, _ = spearmanr(g_vals, r_vals)
+            ics.append(float(ic) if np.isfinite(ic) else float("nan"))
 
         return pd.Series(ics, index=gate.index, name=f"IC_fds_fwd{forward_horizon}")
 
