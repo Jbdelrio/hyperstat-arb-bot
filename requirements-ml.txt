@@ -1,0 +1,30 @@
+# HyperStat v2 — Dépendances supplémentaires (Phase 1)
+# Installer avec : pip install -r requirements-ml.txt
+
+# ─── ML Core ───────────────────────────────────────────────────
+xgboost>=2.0.0
+scikit-learn>=1.4.0
+
+# ─── Deep Learning (optionnel — fallback XGB-only si absent) ───
+# torch>=2.2.0    # décommenter pour activer LSTM
+# Recommandation CPU-only :
+# pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# ─── Feature Engineering ───────────────────────────────────────
+pandas-ta>=0.3.14b          # indicateurs techniques (RSI, MACD, ADX, OBV...)
+scipy>=1.12.0               # Savitzky-Golay denoising (Wang 2025)
+
+# ─── LLM pour Reflect Agent (optionnel — Phase 2) ──────────────
+# anthropic>=0.40.0         # Claude Haiku (low-cost)
+# openai>=1.40.0            # GPT-4o mini (alternative)
+# requests>=2.31.0          # Ollama local
+
+# ─── Déjà dans le projet (rappel) ──────────────────────────────
+# pandas>=2.0
+# numpy>=1.24
+# pyarrow>=14.0
+# duckdb>=0.9
+# plotly>=5.0
+# streamlit>=1.30
+# httpx>=0.26              # Hyperliquid REST
+# websockets>=12.0         # Hyperliquid WS
