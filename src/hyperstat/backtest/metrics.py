@@ -1,7 +1,7 @@
 # src/hyperstat/backtest/metrics.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 import numpy as np
@@ -372,6 +372,69 @@ def compute_performance_metrics(
         pnl_slippage=float(breakdown.get("slippage", 0.0)),
         pnl_net=float(breakdown.get("pnl_net", 0.0)),
     )
+
+
+def slippage_attribution(trades_df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Décompose le coût de slippage total par rapport au VWAP.
+
+    Utile pour diagnostiquer d'où vient la drag sur le Sharpe net et
+    calibrer le paramètre ``k_bps_per_1pct_rv1h`` de SlippageModel.
+
+    Args:
+        trades_df : DataFrame avec colonnes obligatoires :
+            - "direction"    : "BUY" ou "SELL"
+            - "notional"     : montant notionnel de la transaction ($)
+            - "exec_price"   : prix d'exécution réel
+            - "vwap_at_exec" : VWAP calculé au moment de l'exécution
+
+    Returns:
+        dict avec les métriques suivantes :
+            mean_vwap_slip_bps   : slippage moyen vs VWAP en bps (négatif = bon)
+            median_vwap_slip_bps : slippage médian vs VWAP en bps
+            total_slip_cost_pct  : coût total de slippage en % du notionnel
+            pct_beating_vwap     : % des trades exécutés mieux que le VWAP
+            worst_slip_bps       : slippage au 95e percentile (bps)
+
+    Usage ::
+
+        from hyperstat.backtest.metrics import slippage_attribution
+
+        report = slippage_attribution(trades_log_df)
+        print(f"Slippage moyen vs VWAP : {report['mean_vwap_slip_bps']:.1f} bps")
+        print(f"% battant VWAP         : {report['pct_beating_vwap']:.1f}%")
+    """
+    if trades_df is None or trades_df.empty:
+        return {}
+
+    required = {"direction", "notional", "exec_price", "vwap_at_exec"}
+    missing = required - set(trades_df.columns)
+    if missing:
+        raise ValueError(f"slippage_attribution: colonnes manquantes {missing}")
+
+    df = trades_df.copy()
+    direction_sign = df["direction"].str.upper().map({"BUY": 1, "SELL": -1}).fillna(0)
+
+    # Slippage vs VWAP en bps
+    # Pour un achat : exec > vwap → slippage positif (coût)
+    # Pour une vente : exec < vwap → slippage positif (coût)
+    vwap_slip_bps = direction_sign * (
+        (df["exec_price"] - df["vwap_at_exec"]) / (df["vwap_at_exec"] + 1e-12)
+    ) * 10_000.0
+
+    total_notional = float(df["notional"].sum())
+    if total_notional <= 0.0:
+        return {}
+
+    weighted_slip = (vwap_slip_bps * df["notional"]).sum()
+
+    return {
+        "mean_vwap_slip_bps":   float(vwap_slip_bps.mean()),
+        "median_vwap_slip_bps": float(vwap_slip_bps.median()),
+        "total_slip_cost_pct":  float(weighted_slip / total_notional / 100.0),
+        "pct_beating_vwap":     float((vwap_slip_bps < 0.0).mean() * 100.0),
+        "worst_slip_bps":       float(vwap_slip_bps.quantile(0.95)),
+    }
 
 
 def metrics_to_dict(m: PerformanceMetrics, pct_fields: Optional[list[str]] = None) -> Dict[str, str]:

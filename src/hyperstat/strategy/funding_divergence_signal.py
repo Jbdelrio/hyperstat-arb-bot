@@ -488,6 +488,76 @@ class FDSDiagnostics:
 
 
 # ─────────────────────────────────────────────
+# Correctif de staleness du funding
+# ─────────────────────────────────────────────
+
+def funding_staleness_discount(
+    funding_df: "pd.DataFrame",
+    ts_now: "pd.Timestamp",
+    stale_threshold_hours: float = 9.0,
+    max_discount: float = 0.5,
+) -> "pd.Series":
+    """
+    Réduit le poids du FDS quand le funding rate est périmé.
+
+    Sur Hyperliquid, le funding est payé toutes les 8h. Si aucun nouveau
+    taux n'est arrivé depuis plus de ``stale_threshold_hours`` heures,
+    la composante vélocité du FDS est calculée sur un signal constant et
+    devient du bruit artificiel. Ce facteur de discount corrige cela.
+
+    Args:
+        funding_df            : DataFrame avec colonnes ["ts", "symbol", "rate"].
+                                La colonne "ts" doit être en datetime UTC.
+        ts_now                : timestamp courant.
+        stale_threshold_hours : délai (en heures) à partir duquel on commence
+                                à discounter. Défaut 9h (légèrement > 8h Hyperliquid).
+        max_discount          : réduction maximale applicable. 0.5 → au pire
+                                le FDS est réduit de 50%.
+
+    Returns:
+        pd.Series indexée par symbol, valeurs ∈ [max_discount, 1.0].
+        Multiplier le score FDS_i par ce facteur avant l'assemblage.
+
+    Intégration dans FundingDivergenceSignalLive.apply_gate() ::
+
+        from hyperstat.strategy.funding_divergence_signal import funding_staleness_discount
+
+        discount = funding_staleness_discount(funding_df_raw, ts_now)
+        fds_scores_adj = {
+            s: fds_scores.get(s, 0.0) * float(discount.get(s, 1.0))
+            for s in fds_scores
+        }
+        w = self.fds.apply_gate(w, fds_scores_adj)
+    """
+    import pandas as pd
+
+    df = funding_df.copy()
+    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+
+    ts_now_utc = pd.Timestamp(ts_now, tz="UTC") if getattr(ts_now, "tzinfo", None) is None else ts_now
+
+    latest = (
+        df[df["ts"] <= ts_now_utc]
+        .groupby("symbol")["ts"]
+        .max()
+    )
+
+    if latest.empty:
+        return pd.Series(dtype=float)
+
+    hours_since = (ts_now_utc - latest).dt.total_seconds() / 3600.0
+
+    discount = pd.Series(1.0, index=latest.index, name="staleness_discount", dtype=float)
+    stale_mask = hours_since > stale_threshold_hours
+    excess_fraction = (
+        (hours_since[stale_mask] - stale_threshold_hours) / stale_threshold_hours
+    ).clip(upper=1.0)
+    discount[stale_mask] = (1.0 - max_discount * excess_fraction)
+
+    return discount.clip(lower=max_discount)
+
+
+# ─────────────────────────────────────────────
 # Test / démo rapide
 # ─────────────────────────────────────────────
 

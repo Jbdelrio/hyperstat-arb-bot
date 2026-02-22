@@ -73,6 +73,52 @@ class TradeCostBreakdown:
         self.slippage += float(slippage)
 
 
+def vwap_adjusted_slippage(
+    rv_1h_pct: float,
+    vwap_deviation_bps: float,
+    order_size_pct_adv: float = 0.01,
+) -> float:
+    """
+    Slippage ajusté VWAP — modèle plus conservateur que le proxy vol seul.
+
+    Formule combinée :
+        slip_bps = base_slip + vol_impact + market_impact + vwap_dev_penalty
+
+    Composantes :
+        base_slip        = 8 bps                                (spread bid-ask estimé)
+        vol_impact       = 10 × rv_1h_pct                       (cohérent avec SlippageModel)
+        market_impact    = 5 × sqrt(order_size_pct_adv) × 100   (modèle racine carrée)
+        vwap_dev_penalty = 0.2 × vwap_deviation_bps             (exécution hors VWAP)
+
+    Args:
+        rv_1h_pct           : realized volatility 1h en % (ex : 1.2 pour 1.2%).
+                              Note : SlippageModel.slippage_bps() prend rv_1h en fraction
+                              et le multiplie par 100 en interne.
+        vwap_deviation_bps  : |close - VWAP| / VWAP × 10 000.
+        order_size_pct_adv  : fraction du volume journalier moyen traité.
+                              Défaut 1% (ordres de taille modeste sur Hyperliquid).
+
+    Returns:
+        Slippage estimé en bps (float).
+
+    Usage dans le backtest ::
+
+        from hyperstat.backtest.costs import vwap_adjusted_slippage
+
+        slip = vwap_adjusted_slippage(
+            rv_1h_pct=rv * 100,            # convertir fraction → %
+            vwap_deviation_bps=vwap_dev,
+            order_size_pct_adv=notional / daily_volume,
+        )
+        total_cost = notional * (fee_bps + slip) / 1e4
+    """
+    base_slip = 8.0
+    vol_impact = 10.0 * float(rv_1h_pct)
+    market_impact = 5.0 * float(np.sqrt(max(0.0, order_size_pct_adv))) * 100.0
+    vwap_dev_penalty = 0.2 * float(vwap_deviation_bps)
+    return base_slip + vol_impact + market_impact + vwap_dev_penalty
+
+
 def cost_model_from_config(cfg: dict) -> CostModel:
     exe = (cfg.get("execution", {}) or {})
     fees = (exe.get("fees", {}) or {})
