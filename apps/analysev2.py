@@ -31,7 +31,14 @@ from hyperstat.strategy.stat_arb import StatArbStrategy, StatArbConfig
 from hyperstat.strategy.regime import RegimeModel, RegimeConfig
 from hyperstat.strategy.allocator import PortfolioAllocator, AllocatorConfig
 from hyperstat.strategy.funding_overlay import FundingOverlayModel, FundingOverlayConfig
-from hyperstat.strategy.funding_divergence_signal import FundingDivergenceSignal, FDSConfig, FDSDiagnostics
+from hyperstat.strategy.funding_divergence_signal import (
+    FundingDivergenceSignal, FDSConfig, FDSDiagnostics, funding_staleness_discount,
+)
+from hyperstat.strategy.regime import detect_volatility_regime_break
+from hyperstat.execution.vwap_strategy import (
+    OrderSlicer, ExecutionConfig, calculate_vwap, calculate_twap,
+)
+from hyperstat.backtest.costs import vwap_adjusted_slippage
 
 # ══════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -434,6 +441,51 @@ def compute_fds_analysis(_candles, _funding, coins, tf_min, fds_params, d_start,
     return gate_df, ic_series, breakdown_df, returns_df, funding_df
 
 
+@st.cache_data(show_spinner=False)
+def compute_vwap_analysis(_candles, coins, tf_min, vwap_window, order_size_pct_adv):
+    """
+    Pour chaque coin : calcule la déviation VWAP, le slippage standard et ajusté.
+    Retourne un dict {symbol: dict de Series}.
+    """
+    results = {}
+    bars_per_hour = max(1, 60 // tf_min)
+
+    for c in coins:
+        df = _candles.get(c)
+        if df is None or df.empty or len(df) < vwap_window + 2:
+            continue
+
+        dfi = df.copy()
+        if "ts" in dfi.columns:
+            dfi = dfi.set_index("ts").sort_index()
+
+        vwap_s = calculate_vwap(dfi, vwap_window)
+        twap_s = calculate_twap(dfi, vwap_window)
+        cp     = dfi["close"].astype(float)
+
+        vwap_dev_bps = ((cp - vwap_s) / (vwap_s + 1e-10) * 10_000.0).rename("vwap_dev_bps")
+
+        log_r = np.log(cp / cp.shift(1))
+        rv_pct = log_r.rolling(bars_per_hour, min_periods=1).std() * 100.0
+
+        std_slip_bps = (8.0 + 10.0 * rv_pct).rename("std_slip_bps")
+        adj_slip_bps = (
+            std_slip_bps
+            + 0.2 * vwap_dev_bps.abs()
+            + 5.0 * float(np.sqrt(order_size_pct_adv)) * 100.0
+        ).rename("adj_slip_bps")
+
+        results[c] = {
+            "vwap": vwap_s,
+            "twap": twap_s,
+            "close": cp,
+            "vwap_dev_bps": vwap_dev_bps,
+            "std_slip_bps": std_slip_bps,
+            "adj_slip_bps": adj_slip_bps,
+        }
+    return results
+
+
 # ══════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════
@@ -491,6 +543,7 @@ with st.sidebar:
     fee_bps   = st.slider("Fees taker (bps)", 1, 20, 6)
     slip_base = st.slider("Slippage base (bps)", 0, 30, 8)
     slip_k    = st.slider("Slippage k", 0, 30, 10)
+    order_size_pct_adv = st.slider("Taille ordre (% ADV)", 0.1, 5.0, 1.0, 0.1) / 100
 
     st.markdown("## Risk")
     max_dd   = st.slider("Max DD intraday (%)", 1, 15, 3) / 100
@@ -571,12 +624,13 @@ st.markdown(
 # ══════════════════════════════════════════════════════════════
 # TABS  — ajout de l'onglet FDS
 # ══════════════════════════════════════════════════════════════
-tab_market, tab_corr, tab_signal, tab_fds, tab_backtest = st.tabs([
+tab_market, tab_corr, tab_signal, tab_fds, tab_backtest, tab_exec = st.tabs([
     "📈  MARCHÉ",
     "🔗  CORRÉLATIONS",
     "⚡  SIGNAUX Z-SCORE",
     "🧠  FDS · VALIDATION",
     "🏦  BACKTEST",
+    "⚙️  EXÉCUTION",
 ])
 
 # ──────────────────────────────────────────────────────────────
@@ -805,6 +859,78 @@ with tab_signal:
         fig_fund.update_layout(title="Funding rate (%) par coin")
         st.plotly_chart(fig_fund, use_container_width=True)
 
+    # ── Détecteur de rupture de régime (vol BTC) ─────────────────────────────
+    section("Détecteur de rupture de régime de volatilité (BTC)")
+    st.markdown(
+        '<div class="info-strip">'
+        '📡 <b>detect_volatility_regime_break</b> — ratio EWMA vol court-terme / long-terme sur BTC. '
+        'Quand le ratio dépasse 2.5, la volatilité intraday explose : le régime mean-reversion '
+        'est probablement cassé (liquidations, news macro). Le gating réduit l\'exposition à 0 '
+        'ou 0.5 pendant ces épisodes pour limiter le drawdown.'
+        '</div>', unsafe_allow_html=True)
+
+    _btc_ref = "BTC" if "BTC" in candles_f else (coins_sel[0] if coins_sel else None)
+    if _btc_ref and not candles_f[_btc_ref].empty:
+        _df_btc = candles_f[_btc_ref]
+        _cl_btc = _df_btc.set_index("ts")["close"].astype(float)
+        _r_btc  = np.log(_cl_btc / _cl_btc.shift(1)).dropna()
+
+        _q_break  = detect_volatility_regime_break(_r_btc, fast_span=4, slow_span=48)
+        _vol_fast = _r_btc.ewm(span=4, min_periods=2).std() * 100
+        _vol_slow = _r_btc.ewm(span=48, min_periods=12).std() * 100
+        _ratio    = (_vol_fast / (_vol_slow + 1e-12)).fillna(1.0)
+
+        fig_reg = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                row_heights=[0.55, 0.45], vertical_spacing=0.04)
+
+        step = max(1, len(_ratio) // 2000)
+        fig_reg.add_trace(go.Scatter(
+            x=_ratio.index[::step], y=_ratio.values[::step],
+            mode="lines", name="Ratio vol fast/slow",
+            line=dict(color="#d29922", width=1.4),
+        ), row=1, col=1)
+        fig_reg.add_hline(y=2.5,  line_dash="dash", line_color="#f85149",
+                          annotation_text="seuil rupture 2.5", row=1, col=1)
+        fig_reg.add_hline(y=2.0,  line_dash="dot",  line_color="#d29922",
+                          annotation_text="zone transition 2.0", row=1, col=1)
+
+        fig_reg.add_trace(go.Scatter(
+            x=_q_break.index[::step], y=_q_break.values[::step],
+            mode="lines", name="Q_vol_break",
+            line=dict(color="#58a6ff", width=1.8),
+            fill="tozeroy", fillcolor="rgba(88,166,255,0.08)",
+        ), row=2, col=1)
+        fig_reg.add_hline(y=0.5, line_dash="dot", line_color="#d29922", row=2, col=1)
+
+        pct_blocked = float((_q_break < 1.0).mean() * 100)
+        fig_reg.update_layout(
+            template="plotly_dark", height=380,
+            paper_bgcolor=PAPER, plot_bgcolor=BG,
+            margin=dict(l=12, r=12, t=36, b=12),
+            font=dict(family="IBM Plex Mono", size=11, color="#8b949e"),
+            legend=dict(font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
+            title=dict(
+                text=f"Rupture de vol · {_btc_ref} · {pct_blocked:.1f}% du temps gatée",
+                font=dict(size=13, color="#58a6ff")),
+        )
+        fig_reg.update_xaxes(gridcolor=GRID)
+        fig_reg.update_yaxes(gridcolor=GRID)
+        st.plotly_chart(fig_reg, use_container_width=True)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            n_breaks = int((_q_break == 0.0).sum())
+            kpi("Ruptures (Q=0)", f"{n_breaks:,} barres",
+                "negative" if n_breaks > len(_q_break) * 0.05 else "neutral")
+        with col2:
+            n_trans = int((_q_break == 0.5).sum())
+            kpi("Transition (Q=0.5)", f"{n_trans:,} barres", "neutral")
+        with col3:
+            kpi("% temps tradeable", f"{100 - pct_blocked:.1f}%",
+                "positive" if pct_blocked < 10 else "neutral")
+    else:
+        st.info("Ajoute BTC à la sélection pour afficher le détecteur de rupture de régime.")
+
 # ──────────────────────────────────────────────────────────────
 # TAB 4 — FDS VALIDATION  (NOUVEAU)
 # ──────────────────────────────────────────────────────────────
@@ -972,6 +1098,73 @@ with tab_fds:
                        font=dict(size=13, color="#58a6ff")),
         )
         st.plotly_chart(fig_heat, use_container_width=True)
+
+    # ── Staleness du funding ─────────────────────────────────────────────────
+    section("Staleness du funding — discount FDS")
+    st.markdown(
+        '<div class="info-strip">'
+        '⏱ <b>funding_staleness_discount</b> — Hyperliquid publie le funding toutes les 8h. '
+        'Entre deux ticks, la composante vélocité du FDS est calculée sur un signal constant → '
+        'bruit artificiel. Ce graphe montre le facteur de discount appliqué à chaque coin '
+        'quand son funding rate n\'a pas été mis à jour depuis plus de 9h.'
+        '</div>', unsafe_allow_html=True)
+
+    if funding_df is not None and not funding_df.empty:
+        # Reconstruire un funding_df long (ts, symbol, rate) depuis le DataFrame wide
+        fund_long_rows = []
+        for sym in funding_df.columns:
+            for ts_idx, rate in funding_df[sym].dropna().items():
+                fund_long_rows.append({"ts": ts_idx, "symbol": sym, "rate": float(rate)})
+
+        if fund_long_rows:
+            fund_long = pd.DataFrame(fund_long_rows)
+            # Calculer le discount pour plusieurs ts représentatifs
+            sample_ts = funding_df.index[::max(1, len(funding_df) // 50)]
+            discount_rows = []
+            for ts_sample in sample_ts:
+                disc = funding_staleness_discount(fund_long, ts_sample)
+                for sym, d in disc.items():
+                    discount_rows.append({"ts": ts_sample, "symbol": sym, "discount": d})
+
+            if discount_rows:
+                disc_df = pd.DataFrame(discount_rows).pivot(
+                    index="ts", columns="symbol", values="discount"
+                ).fillna(1.0)
+
+                fig_stale = dark_fig(280)
+                for i, sym in enumerate(disc_df.columns):
+                    s = disc_df[sym]
+                    step = max(1, len(s) // 2000)
+                    pline(fig_stale, s.index[::step], s.values[::step],
+                          sym, PALETTE[i % len(PALETTE)], width=1.4)
+                fig_stale.add_hline(y=1.0, line_dash="dot", line_color="#3fb950",
+                                    annotation_text="pas de discount")
+                fig_stale.add_hline(y=0.5, line_dash="dash", line_color="#f85149",
+                                    annotation_text="discount max 50%")
+                fig_stale.update_layout(
+                    title="Discount staleness par coin · 1.0 = données fraîches",
+                    yaxis=dict(range=[0.4, 1.05]),
+                )
+                st.plotly_chart(fig_stale, use_container_width=True)
+
+                last_disc = disc_df.iloc[-1].sort_values()
+                n_stale = int((last_disc < 1.0).sum())
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    kpi("Coins avec discount",
+                        f"{n_stale}/{len(last_disc)}",
+                        "negative" if n_stale > 0 else "positive")
+                with col2:
+                    kpi("Discount moyen",
+                        f"{last_disc.mean():.3f}",
+                        "neutral")
+                with col3:
+                    worst = last_disc.idxmin()
+                    kpi("Plus stale",
+                        f"{worst} ({last_disc.min():.2f})",
+                        "negative" if last_disc.min() < 0.8 else "neutral")
+    else:
+        st.info("Le calcul du FDS doit être exécuté pour afficher le discount de staleness.")
 
     # ── Guide calibration ───────────────────────────────────────────────────
     section("Guide de calibration")
@@ -1347,5 +1540,317 @@ with tab_backtest:
             f'padding:8px 12px;border-left:2px solid {color};margin:4px 0;">{text}</div>',
             unsafe_allow_html=True)
 
+    # ── Slippage VWAP-ajusté vs Standard ─────────────────────────────────────
+    section("Analyse du slippage — Standard vs VWAP-ajusté")
+    st.markdown(
+        '<div class="info-strip">'
+        '📐 <b>vwap_adjusted_slippage</b> — compare le modèle standard (8 + 10×RV bps) '
+        'avec le modèle VWAP-ajusté qui intègre la déviation prix/VWAP et le market impact '
+        f'(taille ordre = {order_size_pct_adv*100:.1f}% ADV). '
+        'Un écart important entre les deux signale que l\'exécution coûtera plus cher que prévu '
+        'lors des périodes où le prix s\'écarte du VWAP.'
+        '</div>', unsafe_allow_html=True)
+
+    with st.spinner("Calcul VWAP…"):
+        vwap_data = compute_vwap_analysis(
+            _candles=candles_f,
+            coins=tuple(coins_sel),
+            tf_min=tf_min,
+            vwap_window=max(4, 480 // tf_min),   # ~8h de barres
+            order_size_pct_adv=order_size_pct_adv,
+        )
+
+    if vwap_data:
+        # ── Résumé slippage moyen par coin ──────────────────────────────────
+        slip_summary = []
+        for c, d in vwap_data.items():
+            std_m  = float(d["std_slip_bps"].mean())
+            adj_m  = float(d["adj_slip_bps"].mean())
+            dev_m  = float(d["vwap_dev_bps"].abs().mean())
+            excess = adj_m - std_m
+            slip_summary.append({
+                "Coin": c,
+                "Slip std (bps)":     f"{std_m:.1f}",
+                "Slip VWAP-adj (bps)":f"{adj_m:.1f}",
+                "Excès (bps)":        f"{excess:+.1f}",
+                "Dev VWAP moy (bps)": f"{dev_m:.1f}",
+            })
+        if slip_summary:
+            df_sum = pd.DataFrame(slip_summary).set_index("Coin")
+            st.dataframe(df_sum, use_container_width=True)
+
+        # ── Graphe comparatif pour un coin sélectionné ──────────────────────
+        coin_slip = st.selectbox("Coin (analyse slippage)", list(vwap_data.keys()),
+                                  key="slip_coin")
+        if coin_slip in vwap_data:
+            d = vwap_data[coin_slip]
+            fig_slip = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                     row_heights=[0.55, 0.45], vertical_spacing=0.04)
+
+            step = max(1, len(d["close"]) // 2000)
+            idx = d["close"].index
+            fig_slip.add_trace(go.Scatter(
+                x=idx[::step], y=d["close"].values[::step],
+                mode="lines", name="Close", line=dict(color="#e6edf3", width=1.0),
+            ), row=1, col=1)
+            fig_slip.add_trace(go.Scatter(
+                x=idx[::step], y=d["vwap"].values[::step],
+                mode="lines", name="VWAP", line=dict(color="#58a6ff", width=1.6),
+            ), row=1, col=1)
+            fig_slip.add_trace(go.Scatter(
+                x=idx[::step], y=d["twap"].values[::step],
+                mode="lines", name="TWAP", line=dict(color="#bc8cff", width=1.0, dash="dot"),
+            ), row=1, col=1)
+
+            fig_slip.add_trace(go.Scatter(
+                x=idx[::step], y=d["std_slip_bps"].values[::step],
+                mode="lines", name="Slip standard", line=dict(color="#3fb950", width=1.4),
+            ), row=2, col=1)
+            fig_slip.add_trace(go.Scatter(
+                x=idx[::step], y=d["adj_slip_bps"].values[::step],
+                mode="lines", name="Slip VWAP-ajusté", line=dict(color="#d29922", width=1.4),
+            ), row=2, col=1)
+
+            fig_slip.update_layout(
+                template="plotly_dark", height=420,
+                paper_bgcolor=PAPER, plot_bgcolor=BG,
+                margin=dict(l=12, r=12, t=36, b=12),
+                font=dict(family="IBM Plex Mono", size=11, color="#8b949e"),
+                legend=dict(font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
+                title=dict(text=f"{coin_slip} · Prix vs VWAP/TWAP & Slippage estimé",
+                           font=dict(size=13, color="#58a6ff")),
+            )
+            fig_slip.update_xaxes(gridcolor=GRID)
+            fig_slip.update_yaxes(gridcolor=GRID)
+            st.plotly_chart(fig_slip, use_container_width=True)
+
     st.markdown("---")
     st.caption("HyperStat · Backtest sur données réelles Hyperliquid · Ne constitue pas un conseil financier")
+
+# ──────────────────────────────────────────────────────────────
+# TAB 6 — EXÉCUTION VWAP/TWAP
+# ──────────────────────────────────────────────────────────────
+with tab_exec:
+    st.markdown("""
+    <div class="info-strip">
+    ⚙️ <b>Module d'exécution VWAP/TWAP</b> (hyperstat.execution.vwap_strategy)<br>
+    Visualise comment les ordres seraient fragmentés en sous-ordres selon le profil de volume
+    historique, et compare le benchmark VWAP/TWAP avec le prix actuel pour chaque coin.
+    Permet d'estimer le slippage d'exécution réel avant de passer en paper trading.
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Config exécution ──────────────────────────────────────────────────────
+    section("Configuration exécution")
+    col_cfg1, col_cfg2, col_cfg3, col_cfg4 = st.columns(4)
+    with col_cfg1:
+        exec_mode    = st.selectbox("Mode", ["hybrid", "vwap", "twap"], index=0)
+    with col_cfg2:
+        exec_slices  = st.slider("Nombre de tranches", 2, 16, 8)
+    with col_cfg3:
+        exec_window  = st.slider("Fenêtre VWAP (barres)", 4, 48,
+                                  max(4, min(48, 480 // tf_min)))
+    with col_cfg4:
+        exec_tol     = st.slider("Tolérance prix (bps)", 10, 100, 30) / 10_000.0
+
+    exec_cfg = ExecutionConfig(
+        n_slices=exec_slices,
+        vwap_window=exec_window,
+        price_tolerance=exec_tol,
+        mode=exec_mode,
+        vwap_weight=0.6,
+    )
+
+    # ── VWAP / TWAP par coin ──────────────────────────────────────────────────
+    section("Prix vs VWAP/TWAP — dernières 200 barres")
+
+    with st.spinner("Calcul VWAP/TWAP…"):
+        vwap_exec_data = compute_vwap_analysis(
+            _candles=candles_f,
+            coins=tuple(coins_sel),
+            tf_min=tf_min,
+            vwap_window=exec_window,
+            order_size_pct_adv=order_size_pct_adv,
+        )
+
+    coin_exec = st.selectbox("Coin à analyser", list(vwap_exec_data.keys()) or coins_sel,
+                              key="exec_coin")
+
+    if coin_exec in vwap_exec_data:
+        d = vwap_exec_data[coin_exec]
+        tail_n = min(200, len(d["close"]))
+        idx_t  = d["close"].index[-tail_n:]
+
+        fig_vwap = make_subplots(
+            rows=3, cols=1, shared_xaxes=True,
+            row_heights=[0.50, 0.25, 0.25], vertical_spacing=0.03,
+            subplot_titles=["Prix · VWAP · TWAP", "Déviation vs VWAP (bps)", "Slippage estimé (bps)"],
+        )
+
+        fig_vwap.add_trace(go.Scatter(
+            x=idx_t, y=d["close"].loc[idx_t].values,
+            mode="lines", name="Close", line=dict(color="#e6edf3", width=1.2),
+        ), row=1, col=1)
+        fig_vwap.add_trace(go.Scatter(
+            x=idx_t, y=d["vwap"].loc[idx_t].values,
+            mode="lines", name="VWAP", line=dict(color="#58a6ff", width=2.0),
+        ), row=1, col=1)
+        fig_vwap.add_trace(go.Scatter(
+            x=idx_t, y=d["twap"].loc[idx_t].values,
+            mode="lines", name="TWAP", line=dict(color="#bc8cff", width=1.2, dash="dot"),
+        ), row=1, col=1)
+
+        dev = d["vwap_dev_bps"].loc[idx_t]
+        colors_dev = ["#3fb950" if v < 0 else "#f85149" for v in dev.values]
+        fig_vwap.add_trace(go.Bar(
+            x=idx_t, y=dev.values, name="Dev VWAP (bps)",
+            marker_color=colors_dev, opacity=0.75,
+        ), row=2, col=1)
+        fig_vwap.add_hline(y=0, line_dash="dot", line_color="#444", row=2, col=1)
+
+        fig_vwap.add_trace(go.Scatter(
+            x=idx_t, y=d["std_slip_bps"].loc[idx_t].values,
+            mode="lines", name="Slip std", line=dict(color="#3fb950", width=1.2),
+        ), row=3, col=1)
+        fig_vwap.add_trace(go.Scatter(
+            x=idx_t, y=d["adj_slip_bps"].loc[idx_t].values,
+            mode="lines", name="Slip VWAP-adj", line=dict(color="#d29922", width=1.4),
+        ), row=3, col=1)
+
+        fig_vwap.update_layout(
+            template="plotly_dark", height=560,
+            paper_bgcolor=PAPER, plot_bgcolor=BG,
+            margin=dict(l=12, r=12, t=50, b=12),
+            font=dict(family="IBM Plex Mono", size=11, color="#8b949e"),
+            legend=dict(font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
+            title=dict(text=f"{coin_exec} · Analyse VWAP execution",
+                       font=dict(size=13, color="#58a6ff")),
+        )
+        fig_vwap.update_xaxes(gridcolor=GRID)
+        fig_vwap.update_yaxes(gridcolor=GRID)
+        st.plotly_chart(fig_vwap, use_container_width=True)
+
+    # ── Simulation OrderSlicer ────────────────────────────────────────────────
+    section("Simulation OrderSlicer — fragmentation d'un ordre")
+    st.markdown(
+        '<div style="font-family:IBM Plex Sans;font-size:12px;color:#6e7681;margin-bottom:12px;">'
+        'Simule comment un ordre notionnel serait découpé en tranches, '
+        'pondérées par le profil de volume des dernières barres.'
+        '</div>', unsafe_allow_html=True)
+
+    col_sim1, col_sim2, col_sim3 = st.columns(3)
+    with col_sim1:
+        sim_coin      = st.selectbox("Coin", coins_sel, key="sim_coin")
+    with col_sim2:
+        sim_notional  = st.number_input("Notionnel ($)", 100, 100_000, 1_000, 100)
+    with col_sim3:
+        sim_direction = st.selectbox("Direction", ["BUY", "SELL"])
+
+    if sim_coin in candles_f and not candles_f[sim_coin].empty:
+        df_sim = candles_f[sim_coin].tail(exec_window + 10).copy()
+        for col in ("open","high","low","close","volume"):
+            if col in df_sim.columns:
+                df_sim[col] = pd.to_numeric(df_sim[col], errors="coerce")
+        df_sim = df_sim.dropna(subset=["close","volume"])
+
+        slicer = OrderSlicer(cfg=exec_cfg)
+        slices = slicer.slice_order(
+            symbol=sim_coin,
+            direction=sim_direction,
+            total_notional=float(sim_notional),
+            df_recent=df_sim,
+        )
+
+        if slices:
+            current_px = float(df_sim["close"].iloc[-1])
+            vwap_ref   = float(calculate_vwap(df_sim, exec_window).iloc[-1])
+            twap_ref   = float(calculate_twap(df_sim, exec_window).iloc[-1])
+
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+            with col_m1:
+                kpi("Prix actuel",  f"${current_px:,.4f}", "neutral")
+            with col_m2:
+                kpi("VWAP ref",     f"${vwap_ref:,.4f}",   "neutral")
+            with col_m3:
+                kpi("TWAP ref",     f"${twap_ref:,.4f}",   "neutral")
+            with col_m4:
+                dev_bps = (current_px - vwap_ref) / vwap_ref * 10_000
+                kpi("Dev vs VWAP",
+                    f"{dev_bps:+.1f} bps",
+                    "positive" if (sim_direction == "SELL" and dev_bps > 0)
+                               or (sim_direction == "BUY" and dev_bps < 0)
+                               else "negative")
+
+            # Graphe barres des tranches
+            prices, sizes = zip(*slices)
+            weights_pct = [s / sim_notional * 100 for s in sizes]
+
+            fig_slices = dark_fig(260)
+            fig_slices.add_trace(go.Bar(
+                x=[f"T{i+1}" for i in range(len(slices))],
+                y=weights_pct,
+                name="Poids tranche (%)",
+                marker_color="#58a6ff",
+                text=[f"{w:.1f}%" for w in weights_pct],
+                textposition="outside",
+                textfont=dict(family="IBM Plex Mono", size=10),
+            ))
+            fig_slices.update_layout(
+                title=f"{sim_direction} ${sim_notional:,} · {exec_slices} tranches · mode {exec_mode}",
+                yaxis_title="% du notionnel",
+                showlegend=False,
+            )
+            st.plotly_chart(fig_slices, use_container_width=True)
+
+            # Table des tranches
+            st.markdown("**Détail des tranches :**")
+            slices_df = pd.DataFrame([
+                {
+                    "Tranche": f"T{i+1}",
+                    "Prix limite":      f"${p:,.6f}",
+                    "Notionnel ($)":    f"${s:,.2f}",
+                    "% total":          f"{s/sim_notional*100:.1f}%",
+                    "Dev vs VWAP (bps)":f"{(p - vwap_ref)/vwap_ref*10_000:+.1f}",
+                }
+                for i, (p, s) in enumerate(slices)
+            ])
+            st.dataframe(slices_df.set_index("Tranche"), use_container_width=True)
+        else:
+            st.warning(f"Pas assez de données pour {sim_coin} avec la fenêtre VWAP configurée.")
+    else:
+        st.warning(f"Données manquantes pour {sim_coin}.")
+
+    # ── Heatmap déviation VWAP cross-section ─────────────────────────────────
+    section("Heatmap déviation VWAP — tous les coins (dernières 50 barres)")
+    if vwap_exec_data:
+        heat_rows = {}
+        for c, d in vwap_exec_data.items():
+            tail = d["vwap_dev_bps"].tail(50)
+            heat_rows[c] = tail
+
+        heat_df = pd.DataFrame(heat_rows)
+        if not heat_df.empty:
+            fig_heat_vwap = go.Figure(data=go.Heatmap(
+                z=heat_df.T.values,
+                x=[str(t)[:16] for t in heat_df.index],
+                y=list(heat_df.columns),
+                colorscale=[[0,"#f85149"],[0.5,"#161b22"],[1,"#3fb950"]],
+                zmid=0, zmin=-50, zmax=50,
+                hovertemplate="t=%{x}<br>%{y} : %{z:.1f} bps<extra></extra>",
+                colorbar=dict(title="bps", tickfont=dict(family="IBM Plex Mono", size=10)),
+            ))
+            fig_heat_vwap.update_layout(
+                template="plotly_dark",
+                height=max(280, len(heat_df.columns) * 24),
+                paper_bgcolor=PAPER, plot_bgcolor=BG,
+                margin=dict(l=12, r=12, t=36, b=60),
+                font=dict(family="IBM Plex Mono", size=10, color="#8b949e"),
+                title=dict(
+                    text="Déviation prix/VWAP (bps) · vert = prix < VWAP (favorable aux achats)",
+                    font=dict(size=13, color="#58a6ff")),
+                xaxis=dict(tickangle=-45),
+            )
+            st.plotly_chart(fig_heat_vwap, use_container_width=True)
+
+    st.markdown("---")
+    st.caption("HyperStat · Module Exécution VWAP/TWAP · arXiv:2502.13722 (Genet 2025)")
