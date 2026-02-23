@@ -9,6 +9,7 @@ from .loaders import (
     load_funding_from_store,
 )
 from .features import (
+    FundingStats,
     compute_returns,
     compute_ewma_vol,
     compute_rv,
@@ -40,6 +41,7 @@ __all__ = [
     "compute_amihud_illiq",
     "compute_beta_vs_factor",
     "compute_residual_returns",
+    "FundingStats",
     "compute_funding_ewma_stats",
     "select_universe",
     "build_buckets",
