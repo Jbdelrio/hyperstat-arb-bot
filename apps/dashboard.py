@@ -18,6 +18,7 @@ Lancement :
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -238,7 +239,9 @@ with st.sidebar:
     run_path = Path(run_dir)
 
     st.subheader("Refresh")
-    refresh_s = st.number_input("Refresh (sec)", min_value=1, max_value=60, value=3, step=1)
+    auto_refresh = st.toggle("Auto-refresh", value=True)
+    refresh_s = st.number_input("Intervalle (sec)", min_value=5, max_value=120, value=10, step=5,
+                                disabled=not auto_refresh)
 
     st.subheader("Performance window")
     eq_tail    = st.number_input("Equity rows (tail)",  min_value=1000,  max_value=250000,  value=50000,  step=5000)
@@ -270,8 +273,6 @@ with st.sidebar:
     st.markdown(f"<small style='color:#8892a4'>UTC: {datetime.now(timezone.utc).strftime('%H:%M:%S')}</small>",
                 unsafe_allow_html=True)
 
-# Auto-refresh via meta tag (compatible avec tous les browsers)
-st.markdown(f"<meta http-equiv='refresh' content='{int(refresh_s)}'>", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -667,3 +668,10 @@ if show_raw and "Raw Tables" not in section:
     st.dataframe(mids_df.tail(2000), use_container_width=True)
     st.subheader("Raw — weights.csv (tail)")
     st.dataframe(weights_df.tail(2000), use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-REFRESH (st.rerun = delta WebSocket, pas de rechargement navigateur)
+# ─────────────────────────────────────────────────────────────────────────────
+if auto_refresh:
+    time.sleep(int(refresh_s))
+    st.rerun()

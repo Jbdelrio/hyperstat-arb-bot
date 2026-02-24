@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import websockets
-from websockets.client import WebSocketClientProtocol
 
 from .endpoints import HyperliquidEndpoints
 
@@ -40,7 +39,7 @@ class HyperliquidWsClient:
         self.cfg = cfg
         self._log = logging.getLogger("hyperstat.ws")
 
-        self._ws: Optional[WebSocketClientProtocol] = None
+        self._ws: Optional[Any] = None
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
 
@@ -93,7 +92,7 @@ class HyperliquidWsClient:
 
     async def _send(self, msg: Json) -> None:
         ws = self._ws
-        if ws is None or ws.closed:
+        if ws is None:
             return
         try:
             await ws.send(json.dumps(msg))
@@ -173,7 +172,7 @@ class HyperliquidWsClient:
 
             # close and reconnect
             try:
-                if self._ws is not None and not self._ws.closed:
+                if self._ws is not None:
                     await self._ws.close()
             except Exception:
                 pass
