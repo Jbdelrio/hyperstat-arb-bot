@@ -18,6 +18,8 @@
 - [9. Lancer un backtest](#9-lancer-un-backtest)
 - [10. Lancer en paper / live](#10-lancer-en-paper--live)
 - [11. Dashboard Streamlit](#11-dashboard-streamlit)
+  - [11.1 Live Dashboard — Paper Trading Temps Réel](#111-live-dashboard--paper-trading-temps-réel-appslive_dashboardpy)
+  - [11.2 Dashboard Backtest](#112-dashboard-backtest-appsdashboardpy)
 - [12. Calibration du FDS](#12-calibration-du-fds)
 - [13. Notes Hyperliquid (API)](#13-notes-hyperliquid-api)
 - [14. **NEW — Métriques de Performance & Évaluation**](#14-new--métriques-de-performance--évaluation)
@@ -199,6 +201,7 @@ hyperstat-arb-bot/
 │   ├── hyperliquid_testnet.yaml
 │   └── hyperliquid_mainnet.yaml
 ├── apps/
+│   ├── live_dashboard.py  ← dashboard paper trading temps réel (Streamlit)
 │   ├── dashboard.py
 │   └── analyse.py
 ├── src/
@@ -790,10 +793,12 @@ pip install scikit-learn ta-lib  # indicateurs techniques
 Variables d'environnement :
 
 ```bash
+# Optionnel — requis uniquement pour l'exécution d'ordres réels (live trading)
+# Le dashboard live_dashboard.py et le paper trading fonctionnent SANS ces variables
 export HL_ADDRESS=0x...
 export HL_PRIVATE_KEY=0x...
 
-# Optionnel (gratuit, requis pour news enrichies)
+# Optionnel (gratuit, requis pour news enrichies dans les agents IA)
 export CRYPTOCOMPARE_API_KEY=...  # https://min-api.cryptocompare.com (gratuit)
 ```
 
@@ -849,7 +854,11 @@ report.equity_curve.plot()
 ## 10. Lancer en paper / live
 
 ```bash
-# Paper trading
+# [NEW] Dashboard paper trading temps réel (recommandé pour débuter)
+# Aucune clé API requise — données de marché publiques
+streamlit run apps/live_dashboard.py
+
+# Paper trading CLI
 python -m hyperstat.main --config configs/default.yaml \
   --config configs/hyperliquid_testnet.yaml --mode paper
 
@@ -857,7 +866,7 @@ python -m hyperstat.main --config configs/default.yaml \
 python -m hyperstat.main --config configs/default.yaml \
   --config configs/hyperliquid_testnet.yaml --mode paper --enable-agents
 
-# Live
+# Live (nécessite HL_ADDRESS + HL_PRIVATE_KEY pour exécution d'ordres réels)
 bash scripts/run_live.sh
 
 # [NEW] Simulation replay temps réel
@@ -868,11 +877,46 @@ python apps/realtime_sim.py --mode replay --speed 100 --days 30
 
 ## 11. Dashboard Streamlit
 
+### 11.1 Live Dashboard — Paper Trading Temps Réel (`apps/live_dashboard.py`)
+
+Dashboard de **simulation paper trading en temps réel** sur Hyperliquid. Aucune clé API requise : les données de marché sont publiques.
+
+```bash
+streamlit run apps/live_dashboard.py
+```
+
+**Fonctionnalités** :
+- Connexion WebSocket live à Hyperliquid mainnet ou testnet
+- Multi-timeframe : 10s, 30s, 1m, 3m, 5m, 15m, 30m, 1h
+- Horizon dynamique (`horizon_bars`) : cible ~1h de lookback quelle que soit la TF
+- Stratégie stat-arb cross-sectionnel exécutée en paper trading sur `$1 500` notional
+- **Onglet Marché** : prix mid en temps réel pour tous les altcoins de l'univers
+- **Onglet Stratégie** : signaux z-score, positions cibles, allocations par coin
+- **Onglet Portfolio** :
+  - Métriques P&L : PnL net, PnL brut, frais cumulés, retour %, uPnL, notional
+  - Métriques risque : Sharpe annualisé, MaxDD, win rate, nb trades, nb barres
+  - Graphique PnL live : courbe nette (vert), courbe brute (violet pointillé), sous-graphe drawdown
+- Frais simulés : 3.5 bps taker (conforme Hyperliquid)
+- `PaperPortfolio` avec comptabilité PnL correcte (entry price inchangé sur réduction, weighted average uniquement sur ajout de position)
+
+**Architecture interne** :
+```
+Streamlit UI (thread principal)
+    ↕ SharedState (threading.RLock)
+BackgroundEngine (daemon thread + asyncio event loop)
+    ├── HyperliquidWsClient → abonnement allMids en temps réel
+    ├── HyperliquidRestClient → candles historiques au démarrage
+    ├── StatArbStrategy.update() → signaux z-score par barre
+    └── PaperPortfolio.rebalance() → simulation des trades
+```
+
+### 11.2 Dashboard Backtest (`apps/dashboard.py`)
+
 ```bash
 streamlit run apps/dashboard.py
 ```
 
-**v2 — Nouvelles sections du dashboard** :
+**v2 — Nouvelles sections prévues** :
 - Scores des agents en temps réel (TechnicalAgent, SentimentAgent, PredictionAgent)
 - Régime courant détecté (RegimeAgent)
 - Contribution de chaque agent à la décision finale
@@ -906,13 +950,14 @@ print(f"IC moyen : {ic.mean():.4f}   t-stat : {ic.mean()/ic.std()*len(ic)**0.5:.
 
 ## 13. Notes Hyperliquid (API)
 
-- **Auth** : signature EIP-712 avec clé privée (`HL_PRIVATE_KEY`)
+- **Données de marché** : **aucune clé API requise** — REST et WebSocket sont publics pour la lecture (prix, candles, funding, order book). Idéal pour le paper trading et le dashboard live.
+- **Auth** : signature EIP-712 avec clé privée (`HL_PRIVATE_KEY`) uniquement pour l'exécution d'ordres réels
 - **Rate limit** : 1200 req/min (on utilise 1100 avec marge) — déjà géré dans `rate_limiter.py`
-- **WS** : max 10 connexions, max 1000 subscriptions
+- **WS** : max 10 connexions, max 1000 subscriptions. Lib `websockets >= 13` utilise `ClientConnection` (plus d'attribut `.closed`) — déjà adapté dans `ws_client.py`
 - **Funding** : toutes les 8h sur Hyperliquid
 - **Perps disponibles** : ~150 altcoins en perpetual futures
-- **Frais taker** : ~0.035% (3.5 bps) — config utilise 6 bps (conservateur)
-- **[NEW] l2Book** : disponible via WS, activer pour features order book
+- **Frais taker** : ~0.035% (3.5 bps) — `live_dashboard.py` simule 3.5 bps, config backtest utilise 6 bps (conservateur)
+- **l2Book** : disponible via WS, activer pour features order book
 
 ---
 
@@ -968,6 +1013,28 @@ print(f"IC moyen : {ic.mean():.4f}   t-stat : {ic.mean()/ic.std()*len(ic)**0.5:.
 ---
 
 ## 15. Bugs connus / TODO
+
+### Bugs corrigés (live_dashboard.py)
+
+**✅ Module `hyperstat.exchange.hyperliquid.sandbox` inexistant**
+
+`exchange/hyperliquid/__init__.py` importait `HyperliquidSandboxExchange` depuis un fichier `sandbox.py` qui n'existait pas. Import et entrée `__all__` supprimés.
+
+**✅ Incompatibilité `websockets >= 13` (`ClientConnection` sans `.closed`)**
+
+`websockets >= 13` remplace `WebSocketClientProtocol` par `ClientConnection` qui n'a pas d'attribut `.closed`. Tous les checks `ws.closed` supprimés dans `ws_client.py`, remplacement par try/except.
+
+**✅ Callback WebSocket `async` non attendu**
+
+`_on_mids` était déclaré `async def` mais `ws_client` appelle les callbacks de façon synchrone (`WSCallback = Callable[[Json], None]`). Converti en `def` ordinaire.
+
+**✅ Bug PnL catastrophique (résultats en quadrillions)**
+
+Dans `PaperPortfolio.rebalance()`, le prix d'entrée moyen pondéré était recalculé lors d'une **réduction** de position, ce qui gonflait artificiellement le prix d'entrée des parts restantes. Exemple : short 5000 @ $0.16, fermeture 2000 @ $0.14 → ancien code donnait un entry de $0.36 au lieu de $0.16 pour les 3000 restants, produisant un PnL fictif à chaque barre. Corrigé : weighted average uniquement lors d'un **ajout** à la position ; lors d'une réduction, l'entry reste inchangé.
+
+**✅ PnL réalisé non crédité à l'equity**
+
+`self.equity += rpnl` manquait lors de la fermeture de positions, empêchant la capitalisation du PnL réalisé.
 
 ### Bugs critiques (Phase 0 — à corriger avant tout backtest)
 
