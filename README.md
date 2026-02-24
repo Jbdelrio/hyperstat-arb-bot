@@ -8,6 +8,8 @@
 ## Sommaire
 
 - [1. Stratégie](#1-stratégie)
+  - [1.7 Coûts & Break-Even](#17-coûts--réalisme--formalisation-break-even)
+  - [1.9 Architecture 7 Signal Agents](#19-architecture-7-signal-agents--formules--profils-anti-frais)
 - [2. Architecture du code](#2-architecture-du-code)
 - [3. **NEW — Architecture Multi-Agents IA**](#3-new--architecture-multi-agents-ia)
 - [4. **NEW — Revue des Papiers Scientifiques & Applicabilité**](#4-new--revue-des-papiers-scientifiques--applicabilité)
@@ -167,13 +169,27 @@ $$w^{final} = w^{stat} + \eta \cdot Q^{fund} \cdot w^{fund}$$
 
 ---
 
-### 1.7 Coûts & Réalisme
+### 1.7 Coûts & Réalisme — Formalisation Break-Even
 
-$$\text{slip}_{bps} = 8 + 10 \cdot RV_{1h}(\%)$$
+$$\text{slip}_{bps} = 8 + 10 \cdot RV_{1h}(\%), \qquad \text{TO}_t = \sum_i |\Delta w_{i,t}|$$
 
-$$\text{Cost}_t = \sum_i |\Delta w_{i,t}| \cdot \text{Equity}_t \cdot \frac{\text{fee}_{bps} + \text{slip}_{bps}}{10^4}$$
+$$\text{Cost}_t = \text{TO}_t \cdot \frac{\text{fee}_{bps} + \text{slip}_{bps}}{10^4} \cdot \text{Equity}_t$$
 
-Paramètres par défaut (mode taker) : fee = 6 bps, slip base = 8 bps.
+Paramètres par défaut (mode taker) : fee = 6 bps, slip base = 8 bps. Dashboard live : fee = 3.5 bps (HL taker standard), slip = 10 bps.
+
+**Condition de rentabilité au pas de temps** :
+$$\underbrace{\sum_i w_{i,t}\, r_{i,t+1}}_{\text{gross return}} > \underbrace{\text{TO}_t \cdot \frac{\text{fee}_{bps} + \text{slip}_{bps}}{10^4}}_{\text{cost drag}}$$
+
+**Break-even round-trip** — pour amortir un aller-retour en taker :
+$$\Delta p^{BE}_{bps} \approx 2(\text{fee}_{bps} + \text{slip}_{bps}) + \text{buffer}$$
+
+Exemple : fee = 3.5 bps, slip = 10 bps, buffer = 3 bps → **seuil 30 bps**. Un signal MR de 5–15 bps ne survit pas si le turnover est élevé.
+
+**Filtre no-trade global (HyperStat)** : trade uniquement si
+$$\text{Edge}^{pred}_{i,t} > 2(\text{fee}_{bps} + \text{slip}_{bps}) + \text{buffer}$$
+Proxy dans `CostAwareRebalancer` : $|\Delta w| \times 10\,000 \geq 30\,\text{bps}$.
+
+**Remarque funding HL** : le funding 8h est **payé chaque heure à ⅛**. L'amortissement d'un carry doit donc être calculé sur les heures cumulées, pas sur la période 8h globale.
 
 ---
 
@@ -182,6 +198,138 @@ Paramètres par défaut (mode taker) : fee = 6 bps, slip base = 8 bps.
 - Kill-switch drawdown intraday : si DD > 3% → flat + cooldown 12h
 - Emergency flatten par coin : si $|z| > 3.5$ → target = 0
 - Caps d'expo : coin (12%) / bucket (35%) / gross total (140%)
+
+---
+
+### 1.9 Architecture 7 Signal Agents — Formules & Profils Anti-Frais
+
+Chaque agent produit un portefeuille cible $w^{(k)}_t$ indépendant. Ils diffèrent par leur **profil turnover/edge**, ce qui permet une diversification des coûts au niveau du portefeuille agrégé.
+
+#### Agent 1 — Stat-Arb MR + FDS *(code : existant)*
+
+Signal central (voir §1.2–1.4). Modèle OU implicite :
+
+$$\mathbb{E}[\Delta S \mid S_t] \approx c \cdot |z_{i,t}| \cdot (1 - e^{-\kappa \tau})$$
+Gate anti-frais — entrée uniquement si :
+
+$$c \cdot |z_{i,t}| \cdot (1 - e^{-\kappa \tau}) > 2(\text{fee} + \text{slip}) + \text{buffer}$$
+→ En pratique : relever $z_{in}$ quand $RV_{1h}$ est élevé plutôt qu'augmenter la fréquence.
+
+---
+
+#### Agent 2 — Cross-Sectional Momentum bucket-neutral *(code : `momentum.py`)*
+
+Long gagnants / short perdants intra-bucket. Complémentaire du MR en régime **trending**.
+
+$$m_{i,t} = \text{rank}_B\!\left(R^{(H_1)}_{i,t}\right) - \text{rank}_B\!\left(R^{(H_2)}_{i,t}\right), \quad H_1 > H_2$$
+
+$$w^{mom}_{i,t} \propto \frac{\text{clip}(m_{i,t},[-m_{max}, m_{max}])}{\hat\sigma_{i,t}}$$
+
+Anti-frais : rebalance toutes les 30 min minimum, filtre $|w^{tgt} - w^{cur}| > \delta_w$.
+
+---
+
+#### Agent 3 — Funding Carry pur stable *(code : `funding_carry_pure.py`)*
+
+PnL carry horaire (HL paye à ⅛ de $F^{8h}$) :
+
+$$\Pi^{fund}_{i, t\to t+1h} \approx -N_{i,t} \cdot \frac{F^{8h}_{i,t}}{8}$$
+
+Signal carry stable (gate stabilité) :
+
+$$c_{i,t} = -z\!\left(\text{EWMA}_{\tau_s}(f_{i,t})\right) \cdot \mathbf{1}\!\left[\text{std}(f_i) < \theta_f\right]$$
+
+$$w^{carry}_{i,t} \propto \frac{c_{i,t}}{\hat\sigma_{i,t}} \quad \text{(beta-hedgé BTC)}$$
+
+Condition d'amortissement des frais :
+
+$$\sum_{h=1}^{H} \left|f^{hour}_{i,t+h}\right| > 2(\text{fee} + \text{slip})$$
+→ Modules à très **faible turnover** (rebalance ≤ 2×/jour).
+
+---
+
+#### Agent 4 — Liquidation Reversion event-driven *(code : `liquidation_reversion.py`)*
+
+Signal de cascade de liquidations (via flux `trades` comme proxy) :
+
+$$L_{i,t} = \frac{\text{vol\_récent}_{i,t} - \text{ADV\_ewma}_{i,t}}{\text{ADV\_ewma}_{i,t} + \varepsilon}$$
+
+Position contrariante (si reconstruction du carnet confirmée) :
+
+$$w^{liqMR}_{i,t} = -\text{sign}(L_{i,t}) \cdot g(|L_{i,t}|) \cdot \mathbf{1}[|L| > \theta_L]$$
+
+$g$ concave : $g(L) = \min(L, L_{max})^{0.5}$. Edge "gros" sur peu de trades → facilement amorti.
+Seuil requis : $3 \times \text{round-trip}$ (événements à haute conviction uniquement).
+
+---
+
+#### Agent 5 — Order Book Imbalance microstructure *(code : `ob_imbalance.py`)*
+
+$$I_{i,t} = \frac{Q^{bid}_{i,t} - Q^{ask}_{i,t}}{Q^{bid}_{i,t} + Q^{ask}_{i,t} + \varepsilon}$$
+
+$$OFI_{i,t} = \Delta Q^{bid}_{i,t} - \Delta Q^{ask}_{i,t}$$
+
+Modèle prédictif (coefficients empiriques $a, b$) :
+
+$$\mathbb{E}[r_{i, t\to t+\tau}] = a \cdot OFI_{i,t} + b \cdot I_{i,t}$$
+
+Filtre strict (micro-horizon = coût élevé) :
+
+$$|\mathbb{E}[r]| > 2(\text{fee} + \text{slip}) + \text{buffer} \quad (30\,\text{bps})$$
+→ OFF par défaut. Rentable uniquement sur coins très liquides + exécution propre.
+
+---
+
+#### Agent 6 — PCA Residual Mean-Reversion *(code : `pca_residual_mr.py`)*
+
+Facteur-model via SVD de la matrice de rendements $R$ (n\_syms × window) :
+
+$$R = U \Sigma V^\top, \quad B = U_{:,1:k} \quad (k\text{ left singular vectors, asset space})$$
+
+Rendement expliqué par les $k$ facteurs :
+
+$$\hat r_{i,t} = B_i^\top f_t, \quad f_t = B^\top r_t$$
+
+Résidu facteur-neutralisé :
+
+$$\varepsilon_{i,t} = r_{i,t} - \hat r_{i,t}$$
+
+Z-score résiduel intra-bucket :
+
+$$z^{res}_{i,t} = \frac{\varepsilon_{i,t} - \text{median}_B(\varepsilon_t)}{\text{MAD}_B(\varepsilon_t) + \varepsilon}$$
+
+Signal MR sur résidus (hystérésis identique à Agent 1) :
+
+$$s^{res}_{i,t} = -\text{clip}(z^{res}_{i,t}, [-z_{max}, z_{max}])$$
+
+Avantage : signal plus "propre" → moins de faux positifs → turnover réduit vs MR naïf.
+Refit PCA toutes les 20 barres. **Note** : utiliser $U$ (vecteurs singuliers **gauches**, espace actifs), PAS $V^\top$ (espace temps) — bug corrigé, voir §15.
+
+---
+
+#### Agent 7 — Quality / Liquidity Premium *(code : `quality_liquidity.py`)*
+
+Score qualité composite cross-sectionnel :
+
+$$q_{i,t} = \alpha \cdot \text{rank}(DV_{i,t}) + \beta \cdot (1 - \text{rank}(ILLIQ_i)) - \gamma \cdot \text{rank}(\text{spread}_{i,t}) - \eta \cdot \text{rank}(\text{fundingInstab}_{i,t})$$
+
+$$w^{qual}_{i,t} \propto \frac{q_{i,t} - \text{median}(q_t)}{\hat\sigma_{i,t}}$$
+
+Rebalance ≤ 2×/jour. Très faible turnover → **stabilisateur** de portefeuille, amortit les coûts au niveau agrégé.
+
+---
+
+#### Profils comparés (résumé)
+
+| Agent | Turnover | Edge typique | Condition anti-frais |
+|-------|----------|-------------|----------------------|
+| 1 — Stat-Arb MR | Moyen | MR $|z| > z_{in}$ | $z_{in}$ adaptatif, min hold 30 min |
+| 2 — Momentum | Faible | Trend cross-bucket | Rebalance ≥ 30 min, $\delta_w$ threshold |
+| 3 — Carry | Très faible | Carry cumulé $> 2 \times$ frais | Rebalance ≤ 2×/jour |
+| 4 — Liq. Reversion | Rare | Gros edge event | Seuil $3 \times$ round-trip |
+| 5 — OB Imbalance | Élevé | OFI micro | $|\mathbb{E}[r]| > 30\,bps$ strict |
+| 6 — PCA Residual MR | Moyen | MR résiduel propre | Mêmes règles qu'Agent 1 |
+| 7 — Quality/Liq | Très faible | Premium factor | Rebalance ≤ 2×/jour |
 
 ---
 
@@ -209,7 +357,10 @@ hyperstat-arb-bot/
 │       ├── core/          (clock, logging, types, math, risk)
 │       ├── data/          (storage, loaders, features, universe)
 │       ├── exchange/      (sandbox, hyperliquid REST+WS)
-│       ├── strategy/      (stat_arb, regime, FDS, funding_overlay, allocator)
+│       ├── strategy/      (stat_arb, regime, FDS, funding_overlay, allocator,
+│       │                   base_signal_agent, momentum, funding_carry_pure,
+│       │                   pca_residual_mr, quality_liquidity,
+│       │                   liquidation_reversion, ob_imbalance)
 │       ├── backtest/      (engine, costs, metrics, reports)
 │       ├── live/          (runner, order_manager, health)
 │       ├── monitoring/    (risk_metrics, sink)
@@ -296,6 +447,35 @@ class SupervisorAgent:
 **Logique de combinaison** :
 
 $$w^{final} = w^{stat} \cdot \underbrace{(1 + \alpha_{fds} \cdot \text{FDS})}_{\text{existant}} \cdot \underbrace{(1 + \alpha_{sent} \cdot \text{SENT})}_{\text{nouveau}} \cdot \underbrace{Q^{regime}_{llm}}_{\text{nouveau}}$$
+
+**Allocation cost-aware entre les 7 agents** :
+
+Chaque agent $k$ produit un portefeuille cible $w^{(k)}_t$. Le Supervisor calcule le portefeuille agrégé :
+
+$$w^{raw}_t = \sum_{k=1}^{K} a_{k,t}\, w^{(k)}_t$$
+
+Coefficients $a_{k,t}$ basés sur le **net-edge** (edge prédit moins coût) :
+
+$$\text{NE}_{k,t} = \hat\mu_{k,t} - \lambda \cdot \widehat{TC}_{k,t}, \quad \widehat{TC}_{k,t} = TO_{k,t} \cdot \frac{\text{fee} + \text{slip}}{10^4}$$
+
+$$a_{k,t} \propto \max(0, \text{NE}_{k,t}) \cdot \frac{1}{\hat\sigma_{k,t}^p}, \quad \sum_k a_{k,t} \leq A_{max}$$
+
+**Masques de régime** (allocation conditionnelle) :
+
+| Régime | MR | Momentum | Carry | Liq MR | OFI | PCA MR | Quality |
+|--------|----|----------|-------|--------|-----|--------|---------|
+| mean_reverting | 1.0 | 0.2 | 0.6 | 0.5 | 0.4 | 1.0 | 0.8 |
+| trending | 0.2 | 1.0 | 0.4 | 0.3 | 0.3 | 0.3 | 0.6 |
+| carry_favorable | 0.5 | 0.3 | 1.0 | 0.2 | 0.1 | 0.5 | 0.7 |
+| high_vol | 0.3 | 0.3 | 0.3 | 0.2 | 0.0 | 0.3 | 0.5 |
+| crisis | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+
+$$a_{k,t} \leftarrow a_{k,t} \cdot m_k(\text{regime}_t) \cdot (1 + \alpha_{sent} \cdot \text{SENT}_t) \cdot Q^{regime}_t$$
+
+**Deux règles pratiques prioritaires** :
+
+1. No-trade global : $\text{TO}_t < TO^{min} \Rightarrow$ ne rien faire (évite le micro-churn)
+2. Edge-per-turnover : n'alloue pas à $k$ si $\hat\mu_{k,t} / TO_{k,t} < \theta$ (turnover trop élevé vs alpha)
 
 ---
 
@@ -877,37 +1057,56 @@ python apps/realtime_sim.py --mode replay --speed 100 --days 30
 
 ## 11. Dashboard Streamlit
 
-### 11.1 Live Dashboard — Paper Trading Temps Réel (`apps/live_dashboard.py`)
+### 11.1 Live Dashboard — Paper Trading Multi-Stratégies (`apps/live_dashboard.py`)
 
-Dashboard de **simulation paper trading en temps réel** sur Hyperliquid. Aucune clé API requise : les données de marché sont publiques.
+Dashboard de **simulation paper trading en temps réel** sur 7 stratégies indépendantes. Aucune clé API requise : les données de marché Hyperliquid sont publiques.
 
 ```bash
 streamlit run apps/live_dashboard.py
 ```
 
-**Fonctionnalités** :
-- Connexion WebSocket live à Hyperliquid mainnet ou testnet
+**7 stratégies indépendantes** (chacune avec son propre `PaperPortfolio`) :
+
+| # | Nom | Type | Défaut |
+|---|-----|------|--------|
+| 1 | Stat-Arb MR + FDS | Mean-Reversion cross-sectionnel | ON |
+| 2 | Cross-Section Momentum | Momentum bucket-neutre | ON |
+| 3 | Funding Carry Pure | Carry funding rate | ON |
+| 4 | PCA Residual MR | MR sur résidus factorisés (SVD) | ON |
+| 5 | Quality / Liquidity | Factor quality + liquidité | ON |
+| 6 | Liquidation Reversion | Event-driven (proxy trades WS) | **OFF** |
+| 7 | OB Imbalance | Microstructure l2Book | **OFF** |
+
+**Fonctionnalités principales** :
+- **Flux unique** : un seul WebSocket Hyperliquid partagé entre toutes les stratégies (pas de re-téléchargement lors d'un restart)
+- **Start / ⏹ Kill / 🔄 Restart par stratégie** depuis le sidebar — le flux reste actif, seul l'agent est tué/repris :
+  - **⏹ Kill** : `slot.enabled = False`, conserve l'historique equity/turnover/fees
+  - **▶ Start** : réactive sans reset (reprend là où on en était)
+  - **🔄 Restart** : reset agent + nouveau `PaperPortfolio` (warmup repart de 0)
+- **Filtre cost-aware global** : `trade only if edge > 2*(fee+slip)+buffer`
+  - `fee = 3.5 bps`, `slip = 10.0 bps`, `buffer = 3.0 bps` → seuil **30 bps**
+  - Formule explicite : `edge_bps ≈ |Δw| × 10 000 ≥ 30 bps`
+- **Turnover & frais par barre, par stratégie** : tracés dans l'onglet Portfolio de chaque stratégie
 - Multi-timeframe : 10s, 30s, 1m, 3m, 5m, 15m, 30m, 1h
-- Horizon dynamique (`horizon_bars`) : cible ~1h de lookback quelle que soit la TF
-- Stratégie stat-arb cross-sectionnel exécutée en paper trading sur `$1 500` notional
-- **Onglet Marché** : prix mid en temps réel pour tous les altcoins de l'univers
-- **Onglet Stratégie** : signaux z-score, positions cibles, allocations par coin
-- **Onglet Portfolio** :
-  - Métriques P&L : PnL net, PnL brut, frais cumulés, retour %, uPnL, notional
-  - Métriques risque : Sharpe annualisé, MaxDD, win rate, nb trades, nb barres
-  - Graphique PnL live : courbe nette (vert), courbe brute (violet pointillé), sous-graphe drawdown
-- Frais simulés : 3.5 bps taker (conforme Hyperliquid)
-- `PaperPortfolio` avec comptabilité PnL correcte (entry price inchangé sur réduction, weighted average uniquement sur ajout de position)
+- **Onglets** :
+  - 📈 **Marché Live** : prix mid temps réel + z-score de référence
+  - 📊 **Signaux** : z-scores et poids par stratégie (sélecteur)
+  - 💼 **Portfolio** : sous-onglet par stratégie active + vue agrégée multi-courbes
+  - ⚙️ **Config** : paramètres courants + constantes cost-aware filter
 
 **Architecture interne** :
 ```
 Streamlit UI (thread principal)
     ↕ SharedState (threading.RLock)
 BackgroundEngine (daemon thread + asyncio event loop)
-    ├── HyperliquidWsClient → abonnement allMids en temps réel
-    ├── HyperliquidRestClient → candles historiques au démarrage
-    ├── StatArbStrategy.update() → signaux z-score par barre
-    └── PaperPortfolio.rebalance() → simulation des trades
+    ├── HyperliquidWsClient → allMids (1 seul flux WS partagé)
+    ├── l2Book / trades WS → activés à la demande (strats 6-7)
+    ├── _poll_funding() → REST toutes les 5 min (async)
+    └── Pour chaque StrategySlot enabled :
+          agent.update(ts, mids, AgentContext)
+          CostAwareRebalancer.filter_trades()   # edge > 30 bps
+          PaperPortfolio.rebalance()
+          turnover_history / fee_history ← log par barre
 ```
 
 ### 11.2 Dashboard Backtest (`apps/dashboard.py`)
@@ -1035,6 +1234,16 @@ Dans `PaperPortfolio.rebalance()`, le prix d'entrée moyen pondéré était reca
 **✅ PnL réalisé non crédité à l'equity**
 
 `self.equity += rpnl` manquait lors de la fermeture de positions, empêchant la capitalisation du PnL réalisé.
+
+**✅ PCA Residual MR — bug SVD (Vt vs U) → tendance négative systématique**
+
+Dans `_refit_pca()`, le code stockait `Vt[:k, :]` (vecteurs singuliers **droits**, espace temporel, shape `k × window`) comme loadings de symboles, alors qu'ils appartiennent à l'espace temps et non à l'espace actifs. Conséquence : la projection factorielle était mathématiquement incorrecte, et les "résidus" calculés contenaient de l'exposition factorielle systématique, produisant une tendance négative linéaire.
+
+Corrigé : on utilise maintenant `U[:, :k]` (vecteurs singuliers **gauches**, espace actifs, shape `n_syms × k`). Projection correcte : `f = L.T @ r`, `r_hat = L @ f`, `resid = r − r_hat` (résidu orthogonal aux facteurs PCA).
+
+**✅ Per-strategy Stop/Start (killswitch) absent**
+
+Le dashboard ne permettait pas de stopper/démarrer une stratégie individuelle pendant que l'engine tournait. Ajout de boutons **⏹ Kill** et **▶ Start** par stratégie dans le sidebar : ils mettent à jour `slot.enabled` et `slot.status` directement dans `SharedState` sans toucher au flux WebSocket.
 
 ### Bugs critiques (Phase 0 — à corriger avant tout backtest)
 

@@ -1,20 +1,18 @@
 # apps/live_dashboard.py
 """
-Live Paper Trading Dashboard — Hyperliquid Exchange
-====================================================
-Connecte aux flux temps réel Hyperliquid (WebSocket allMids).
-Simule la stratégie stat-arb en paper trading — aucun argent réel.
+Live Multi-Strategy Paper Trading Dashboard — Hyperliquid Exchange
+==================================================================
+Supporte 7 stratégies indépendantes, chacune avec son propre PaperPortfolio.
 
 Architecture :
     BackgroundEngine (thread daemon + asyncio)
-        └── WebSocket Hyperliquid (stream_all_mids)
-        └── StatArbStrategy.update() à chaque barre
-        └── PaperPortfolio (simule fills au mid)
-        └── SharedState (thread-safe)
-                ↓
-    Streamlit UI — lit SharedState, affiche métriques / signaux / positions
-                ↓
-    st.rerun() toutes les N secondes (delta WebSocket, sans flash)
+        ├── SharedData          : données marché partagées (mids, price_history, funding, ob, trades)
+        ├── StrategySlot × 7    : état par stratégie (agent + portfolio + historiques)
+        └── CostAwareRebalancer : filtre edge > 2*(fee+slip)+buffer avant toute exécution
+                ↓  SharedState (thread-safe)
+    Streamlit UI — lit SharedState.snapshot()
+        ├── Sidebar : start/stop/restart par stratégie + Reload Config
+        └── Tabs    : Marché | Signaux | Portfolio (sous-onglet par strat + Agrégé) | Config
 
 Lancement :
     streamlit run apps/live_dashboard.py
@@ -27,8 +25,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -47,6 +44,13 @@ from hyperstat.exchange.hyperliquid.rate_limiter import RateLimiter, RateLimiter
 from hyperstat.exchange.hyperliquid.ws_client import HyperliquidWsClient
 from hyperstat.exchange.hyperliquid.market_data import HyperliquidMarketData
 from hyperstat.strategy.stat_arb import StatArbStrategy, StatArbConfig
+from hyperstat.strategy.base_signal_agent import AgentContext, BaseSignalAgent
+from hyperstat.strategy.momentum import CrossSectionalMomentumAgent
+from hyperstat.strategy.funding_carry_pure import FundingCarryPureAgent
+from hyperstat.strategy.liquidation_reversion import LiquidationReversionAgent
+from hyperstat.strategy.ob_imbalance import OrderFlowImbalanceAgent
+from hyperstat.strategy.pca_residual_mr import PCAResiduaMRAgent
+from hyperstat.strategy.quality_liquidity import QualityLiquidityAgent
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,7 +58,7 @@ from hyperstat.strategy.stat_arb import StatArbStrategy, StatArbConfig
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="HyperStat — Live Paper Trading",
+    page_title="HyperStat — Multi-Strategy Live",
     page_icon="🔴",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -63,25 +67,25 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stApp { background-color: #0e1117; color: #fafafa; }
-
-    .badge-live        { background:#1a7a3c; color:#fff; padding:4px 14px; border-radius:14px;
-                         font-size:13px; font-weight:700; animation:pulse 2s infinite; }
-    .badge-connecting  { background:#2a3a6e; color:#fff; padding:4px 14px; border-radius:14px;
-                         font-size:13px; font-weight:700; }
-    .badge-warming_up  { background:#8b6e1a; color:#fff; padding:4px 14px; border-radius:14px;
-                         font-size:13px; font-weight:700; }
-    .badge-error       { background:#8b1a1a; color:#fff; padding:4px 14px; border-radius:14px;
-                         font-size:13px; font-weight:700; }
-    .badge-idle        { background:#3a3a3a; color:#aaa; padding:4px 14px; border-radius:14px;
-                         font-size:13px; font-weight:700; }
-
+    .badge-live        { background:#1a7a3c; color:#fff; padding:3px 10px; border-radius:12px;
+                         font-size:12px; font-weight:700; animation:pulse 2s infinite; }
+    .badge-connecting  { background:#2a3a6e; color:#fff; padding:3px 10px; border-radius:12px;
+                         font-size:12px; font-weight:700; }
+    .badge-warming_up  { background:#8b6e1a; color:#fff; padding:3px 10px; border-radius:12px;
+                         font-size:12px; font-weight:700; }
+    .badge-stopped     { background:#444; color:#aaa; padding:3px 10px; border-radius:12px;
+                         font-size:12px; font-weight:700; }
+    .badge-error       { background:#8b1a1a; color:#fff; padding:3px 10px; border-radius:12px;
+                         font-size:12px; font-weight:700; }
+    .badge-idle        { background:#3a3a3a; color:#aaa; padding:3px 10px; border-radius:12px;
+                         font-size:12px; font-weight:700; }
     @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.65; } }
-
     .section-header {
         color: #7289da; font-size: 13px; font-weight: 600; letter-spacing: 1.5px;
         text-transform: uppercase; border-bottom: 1px solid #2a2d3a;
         padding-bottom: 6px; margin: 16px 0 12px 0;
     }
+    .strat-row { border-bottom: 1px solid #2a2d3a; padding: 8px 0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -92,95 +96,161 @@ st.markdown("""
 
 DEFAULT_EQUITY    = 10_000.0
 DEFAULT_GROSS_LEV = 1.5
-FEE_RATE          = 0.00035    # ~3.5 bps taker Hyperliquid — no market impact assumed
-MAX_EQUITY_PTS    = 5_000      # Taille max de l'historique equity en mémoire
-MIN_BAR_COINS     = 2          # Minimum de coins avec prix pour déclencher une barre
+FEE_RATE          = 0.00035    # 3.5 bps taker Hyperliquid
+MAX_EQUITY_PTS    = 5_000
+MIN_BAR_COINS     = 2
+FUNDING_POLL_S    = 300.0      # poll funding rates every 5 min
 
-# Timeframes disponibles (label → secondes)
 TF_OPTIONS: Dict[str, int] = {
     "10s": 10, "30s": 30,
     "1m": 60, "3m": 180, "5m": 300,
     "15m": 900, "30m": 1800, "1h": 3600,
 }
-TF_DEFAULT        = "5m"       # index par défaut
-HORIZON_BARS_MIN  = 12         # jamais moins de 12 barres de warmup
-HORIZON_BARS_MAX  = 90         # cap pour éviter une attente infinie sur petits TF
+TF_DEFAULT = "5m"
+HORIZON_BARS_MIN = 12
+HORIZON_BARS_MAX = 90
 
-def _horizon_bars(tf_seconds: int) -> int:
-    """Cible ~1h de lookback horizon, encadré entre MIN et MAX."""
-    return max(HORIZON_BARS_MIN, min(HORIZON_BARS_MAX, 3600 // tf_seconds))
-
-FALLBACK_COINS    = [          # Si la récupération de l'univers échoue
+FALLBACK_COINS = [
     "BTC", "ETH", "SOL", "AVAX", "LINK", "ARB", "OP",
     "MATIC", "DOT", "ADA", "BNB", "NEAR", "FTM", "ATOM",
 ]
 
+# ── Cost-aware filter constants ────────────────────────────────────────────────
+FEE_BPS           = 3.5
+SLIP_BPS          = 10.0
+ROUND_TRIP_BPS    = 2.0 * (FEE_BPS + SLIP_BPS)   # 27 bps
+BUFFER_BPS        = 3.0
+THRESHOLD_BPS     = ROUND_TRIP_BPS + BUFFER_BPS   # 30 bps = 0.003
+DELTA_W_MIN       = 0.003   # no-trade zone: ignore deltas < 0.3%
+MIN_TRADE_NOTIONAL = 0.50   # skip trades < $0.50 notional
+
+# ── Strategy registry ──────────────────────────────────────────────────────────
+# name → (factory_fn, enabled_by_default)
+_STRATEGY_REGISTRY: Dict[str, Tuple] = {
+    "Stat-Arb MR + FDS" : (lambda: _StatArbMRWrapper(), True),
+    "Cross-Section Momentum": (lambda: CrossSectionalMomentumAgent(), True),
+    "Funding Carry Pure": (lambda: FundingCarryPureAgent(), True),
+    "PCA Residual MR"   : (lambda: PCAResiduaMRAgent(), True),
+    "Quality / Liquidity": (lambda: QualityLiquidityAgent(), True),
+    "Liquidation Reversion": (lambda: LiquidationReversionAgent(), False),
+    "OB Imbalance"      : (lambda: OrderFlowImbalanceAgent(), False),
+}
+
+STRATEGY_COLORS: Dict[str, str] = {
+    "Stat-Arb MR + FDS"     : "#2ecc71",
+    "Cross-Section Momentum": "#3498db",
+    "Funding Carry Pure"    : "#f39c12",
+    "PCA Residual MR"       : "#9b59b6",
+    "Quality / Liquidity"   : "#1abc9c",
+    "Liquidation Reversion" : "#e74c3c",
+    "OB Imbalance"          : "#e67e22",
+}
+
+
+def _horizon_bars(tf_seconds: int) -> int:
+    return max(HORIZON_BARS_MIN, min(HORIZON_BARS_MAX, 3600 // tf_seconds))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SHARED STATE  (thread-safe entre BackgroundEngine et Streamlit)
+# STAT-ARB WRAPPER  (wraps existing StatArbStrategy as a BaseSignalAgent)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class SharedState:
+class _StatArbMRWrapper(BaseSignalAgent):
+    """Thin wrapper around the existing StatArbStrategy."""
+    name = "Stat-Arb MR + FDS"
+    warmup_bars = HORIZON_BARS_MIN
+    enabled_by_default = True
+
+    def __init__(self, tf_seconds: int = 300) -> None:
+        super().__init__()
+        self._tf_seconds = tf_seconds
+        self._strategy: Optional[StatArbStrategy] = None
+        self._h_bars: int = _horizon_bars(tf_seconds)
+        self._init_strategy()
+
+    def _init_strategy(self) -> None:
+        self._h_bars = _horizon_bars(self._tf_seconds)
+        self.warmup_bars = self._h_bars
+        self._strategy = StatArbStrategy(StatArbConfig(
+            timeframe_minutes=max(1, self._tf_seconds // 60),
+            horizon_bars=self._h_bars,
+        ))
+
+    def reset(self) -> None:
+        self._bars_seen = 0
+        self._init_strategy()
+
+    def update(self, ts, mids, context: AgentContext):
+        from hyperstat.strategy.base_signal_agent import AgentOutput
+        signal = self._strategy.update(ts, mids, context.buckets)
+        self._bars_seen += 1
+        if not self.is_warmed_up:
+            return AgentOutput()
+        return AgentOutput(
+            weights=dict(signal.weights_raw),
+            zscores=dict(signal.zscores),
+            meta=dict(signal.meta),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COST-AWARE REBALANCER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CostAwareRebalancer:
     """
-    État partagé entre le thread asyncio (BackgroundEngine) et le thread Streamlit.
-    Toutes les écritures passent par _lock ; snapshot() retourne une copie sûre.
+    Filters target weights before execution.
+
+    Global rule: trade only if edge > 2*(fee+slip)+buffer  (THRESHOLD_BPS = 30 bps)
+
+    Edge proxy per trade:
+        edge_bps ≈ |delta_w| × 10 000
+        → skip if edge_bps < THRESHOLD_BPS   (= |delta_w| < 0.003)
+
+    Additional guard: skip if |delta_notional| < MIN_TRADE_NOTIONAL ($0.50)
     """
 
-    def __init__(self) -> None:
-        self._lock           = threading.RLock()
-        self.status: str     = "idle"   # idle | connecting | warming_up | live | error
-        self.error: str      = ""
+    @staticmethod
+    def filter_trades(
+        target_w: Dict[str, float],
+        current_w: Dict[str, float],
+        mids: Dict[str, float],
+        equity: float,
+    ) -> Dict[str, float]:
+        result: Dict[str, float] = dict(current_w)  # start from current (hold)
+        for sym, tw in target_w.items():
+            cw = current_w.get(sym, 0.0)
+            delta_w = tw - cw
 
-        # Config runtime
-        self.tf_seconds: int             = TF_OPTIONS[TF_DEFAULT]
-        self.horizon_bars: int           = _horizon_bars(self.tf_seconds)
+            # ── Edge filter: trade only if edge > 2*(fee+slip)+buffer ─────────
+            # Proxy: expected edge ≈ |delta_w| × 10 000 bps
+            # Equivalent to: |delta_w| ≥ THRESHOLD_BPS × 1e-4 = 0.003
+            edge_bps_proxy = abs(delta_w) * 10_000
+            if edge_bps_proxy < THRESHOLD_BPS:   # 30 bps = 2*(3.5+10)+3
+                continue   # expected edge < round-trip cost — skip
 
-        # Données de marché
-        self.mids: Dict[str, float]      = {}
-        self.universe: List[str]         = []
-        self.selected: List[str]         = []
-        self.last_update: Optional[datetime] = None
+            px = mids.get(sym, 0.0)
+            if not (math.isfinite(px) and px > 0):
+                continue
+            delta_notional = abs(delta_w * equity)
+            if delta_notional < MIN_TRADE_NOTIONAL:
+                continue   # trade too small in absolute $ — skip
+            result[sym] = tw
 
-        # Sorties stratégie
-        self.zscores: Dict[str, float]   = {}
-        self.weights: Dict[str, float]   = {}
-        self.signal_ts: Optional[datetime] = None
+        # Also close symbols present in current_w but absent from target_w
+        for sym in list(current_w.keys()):
+            if sym not in target_w and abs(current_w.get(sym, 0.0)) > 1e-12:
+                result[sym] = 0.0
+        return result
 
-        # Portfolio paper
-        self.equity: float               = DEFAULT_EQUITY
-        self.initial_equity: float       = DEFAULT_EQUITY
-        self.equity_history: deque       = deque(maxlen=MAX_EQUITY_PTS)  # [(ts_iso, equity)]
-        self.positions: Dict[str, Dict]  = {}
-        self.n_bars: int                 = 0
-        self.n_wins: int                 = 0
-        self.n_losses: int               = 0
-        self.realized_pnl: float         = 0.0
-        self.total_fees: float           = 0.0
-
-    def snapshot(self) -> Dict[str, Any]:
-        with self._lock:
-            return {
-                "status"        : self.status,
-                "error"         : self.error,
-                "tf_seconds"    : self.tf_seconds,
-                "horizon_bars"  : self.horizon_bars,
-                "mids"          : dict(self.mids),
-                "universe"      : list(self.universe),
-                "selected"      : list(self.selected),
-                "last_update"   : self.last_update,
-                "zscores"       : dict(self.zscores),
-                "weights"       : dict(self.weights),
-                "signal_ts"     : self.signal_ts,
-                "equity"        : self.equity,
-                "initial_equity": self.initial_equity,
-                "equity_history": list(self.equity_history),
-                "positions"     : {k: dict(v) for k, v in self.positions.items()},
-                "n_bars"        : self.n_bars,
-                "n_wins"        : self.n_wins,
-                "n_losses"      : self.n_losses,
-                "realized_pnl"  : self.realized_pnl,
-                "total_fees"    : self.total_fees,
-            }
+    @staticmethod
+    def compute_bar_turnover(
+        prev_w: Dict[str, float],
+        new_w: Dict[str, float],
+    ) -> float:
+        """Turnover = sum of |w_new - w_prev| across all symbols."""
+        all_syms = set(list(prev_w.keys()) + list(new_w.keys()))
+        return float(sum(abs(new_w.get(s, 0.0) - prev_w.get(s, 0.0)) for s in all_syms))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,45 +258,47 @@ class SharedState:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PaperPortfolio:
-    """
-    Simule les trades au mid price avec commission FEE_RATE × notional.
-    Pas d'execution réelle — paper trading uniquement.
-    """
+    """Simulates trades at mid price with FEE_RATE. Independent per strategy."""
 
     def __init__(self, initial_equity: float, gross_leverage: float) -> None:
-        self.equity        = initial_equity
-        self.gross_leverage = gross_leverage
-        self._pos: Dict[str, float]      = {}   # sym -> qty
-        self._entry: Dict[str, float]    = {}   # sym -> avg entry price
+        self.initial_equity  = initial_equity
+        self.equity          = initial_equity
+        self.gross_leverage  = gross_leverage
+        self._pos: Dict[str, float]   = {}
+        self._entry: Dict[str, float] = {}
         self.realized_pnl = 0.0
         self.total_fees   = 0.0
-        self.n_wins       = 0
-        self.n_losses     = 0
+        self.fees_this_bar = 0.0   # reset each bar
+        self.n_wins   = 0
+        self.n_losses = 0
 
-    def rebalance(self, target_weights: Dict[str, float], mids: Dict[str, float]) -> None:
-        """Rebalance le portfolio vers target_weights (déjà normalisés au gross leverage)."""
+    def rebalance(
+        self,
+        target_weights: Dict[str, float],
+        mids: Dict[str, float],
+    ) -> None:
+        self.fees_this_bar = 0.0
         total_eq = self.equity + self._unrealized(mids)
 
         for sym, tgt_w in target_weights.items():
             px = mids.get(sym)
-            if not px or not math.isfinite(px) or px <= 0:
+            if not (px and math.isfinite(px) and px > 0):
                 continue
-
             tgt_qty = (tgt_w * total_eq) / px
             cur_qty = self._pos.get(sym, 0.0)
             delta   = tgt_qty - cur_qty
 
-            if abs(delta * px) < 0.5:           # Ignore les trades < 50 cts
+            if abs(delta * px) < 0.5:
                 continue
 
             fee = abs(delta * px) * FEE_RATE
 
-            # Réalisation du PnL sur fermetures partielles / totales
+            # Realize PnL on closures
             if cur_qty != 0.0 and math.copysign(1, delta) != math.copysign(1, cur_qty):
                 close_qty = min(abs(delta), abs(cur_qty)) * math.copysign(1, cur_qty)
-                rpnl      = close_qty * (px - self._entry.get(sym, px))
+                rpnl = close_qty * (px - self._entry.get(sym, px))
                 self.realized_pnl += rpnl
-                self.equity += rpnl   # crédit du PnL réalisé dans le cash
+                self.equity += rpnl
                 if rpnl > 0:
                     self.n_wins += 1
                 else:
@@ -239,18 +311,16 @@ class PaperPortfolio:
             else:
                 self._pos[sym] = new_qty
                 if cur_qty == 0.0 or math.copysign(1, new_qty) != math.copysign(1, cur_qty):
-                    # Nouvelle position ou flip de direction → entry = prix courant
                     self._entry[sym] = px
                 elif math.copysign(1, delta) == math.copysign(1, cur_qty):
-                    # Ajout à la position (même sens) → prix moyen pondéré
                     self._entry[sym] = (
                         abs(cur_qty) * self._entry.get(sym, px) + abs(delta) * px
                     ) / abs(new_qty)
-                # else: réduction de position (même sens restant) → entry inchangé
-                # Raison: les parts restantes ont toujours le même prix d'entrée original.
+                # else: reducing position → entry unchanged
 
-            self.equity   -= fee
-            self.total_fees += fee
+            self.equity        -= fee
+            self.total_fees    += fee
+            self.fees_this_bar += fee
 
     def _unrealized(self, mids: Dict[str, float]) -> float:
         return sum(
@@ -285,6 +355,139 @@ class PaperPortfolio:
             }
         return out
 
+    def current_weights(self, mids: Dict[str, float]) -> Dict[str, float]:
+        """Current position weights (notional / total_equity)."""
+        teq = self.total_equity(mids)
+        if teq <= 0:
+            return {}
+        return {
+            sym: (qty * mids.get(sym, 0.0)) / teq
+            for sym, qty in self._pos.items()
+            if sym in mids and math.isfinite(mids.get(sym, float("nan")))
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRATEGY SLOT  (per-strategy state container)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class StrategySlot:
+    """
+    Holds the live state of one strategy instance.
+    Thread-safe reads via snapshot().
+    """
+
+    def __init__(
+        self,
+        name: str,
+        agent: BaseSignalAgent,
+        portfolio: PaperPortfolio,
+        enabled: bool = True,
+    ) -> None:
+        self.name      = name
+        self.agent     = agent
+        self.portfolio = portfolio
+        self.enabled   = enabled
+        self.status: str = "warming_up"
+
+        # Per-strategy historical data
+        self.equity_history: deque   = deque(maxlen=MAX_EQUITY_PTS)
+        self.turnover_history: deque = deque(maxlen=MAX_EQUITY_PTS)  # (ts, turnover)
+        self.fee_history: deque      = deque(maxlen=MAX_EQUITY_PTS)  # (ts, fee_this_bar)
+
+        # Last output from agent
+        self.last_weights: Dict[str, float] = {}
+        self.last_zscores: Dict[str, float] = {}
+        self.last_meta: Dict[str, Any]      = {}
+        self.last_bar_weights: Dict[str, float] = {}  # for turnover tracking
+        self.last_bar_ts: Optional[datetime]    = None
+        self.n_bars = 0
+        self.positions: Dict[str, Dict] = {}
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Return a thread-safe dict copy (called under SharedState lock)."""
+        p = self.portfolio
+        return {
+            "name"            : self.name,
+            "status"          : self.status,
+            "enabled"         : self.enabled,
+            "n_bars"          : self.n_bars,
+            "warmup_bars"     : self.agent.warmup_bars,
+            "bars_seen"       : self.agent.bars_seen,
+            "equity"          : p.equity,
+            "initial_equity"  : p.initial_equity,
+            "equity_history"  : list(self.equity_history),
+            "turnover_history": list(self.turnover_history),
+            "fee_history"     : list(self.fee_history),
+            "realized_pnl"    : p.realized_pnl,
+            "total_fees"      : p.total_fees,
+            "n_wins"          : p.n_wins,
+            "n_losses"        : p.n_losses,
+            "weights"         : dict(self.last_weights),
+            "zscores"         : dict(self.last_zscores),
+            "meta"            : dict(self.last_meta),
+            "positions"       : {k: dict(v) for k, v in self.positions.items()},
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SHARED STATE  (thread-safe global container)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SharedState:
+    """
+    Thread-safe shared state between BackgroundEngine and Streamlit UI.
+    Holds market data + per-strategy slots.
+    """
+
+    def __init__(self, initial_equity: float = DEFAULT_EQUITY, gross_leverage: float = DEFAULT_GROSS_LEV) -> None:
+        self._lock = threading.RLock()
+        self.global_status: str = "idle"
+        self.error: str = ""
+
+        # Config
+        self.tf_seconds: int  = TF_OPTIONS[TF_DEFAULT]
+        self.horizon_bars: int = _horizon_bars(self.tf_seconds)
+        self.initial_equity   = initial_equity
+        self.gross_leverage   = gross_leverage
+
+        # Market data (shared)
+        self.mids: Dict[str, float]         = {}
+        self.universe: List[str]            = []
+        self.selected: List[str]            = []
+        self.last_update: Optional[datetime] = None
+        self.funding_rates: Dict[str, float] = {}
+
+        # Strategy slots
+        self.strategies: Dict[str, StrategySlot] = {}
+
+        # Config dict (for "Reload Config" button)
+        self.config: Dict[str, Any] = {}
+
+    def get_active_strategies(self) -> List[str]:
+        return [name for name, slot in self.strategies.items() if slot.enabled]
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            strat_snaps = {
+                name: slot.snapshot()
+                for name, slot in self.strategies.items()
+            }
+            return {
+                "global_status" : self.global_status,
+                "error"         : self.error,
+                "tf_seconds"    : self.tf_seconds,
+                "horizon_bars"  : self.horizon_bars,
+                "initial_equity": self.initial_equity,
+                "mids"          : dict(self.mids),
+                "universe"      : list(self.universe),
+                "selected"      : list(self.selected),
+                "last_update"   : self.last_update,
+                "funding_rates" : dict(self.funding_rates),
+                "strategies"    : strat_snaps,
+                "config"        : dict(self.config),
+            }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BACKGROUND ENGINE  (thread daemon + asyncio)
@@ -292,11 +495,11 @@ class PaperPortfolio:
 
 class BackgroundEngine:
     """
-    Tourne dans un thread daemon avec son propre event loop asyncio.
-    - Connecte au WebSocket Hyperliquid (stream_all_mids)
-    - Forme des barres toutes les tf_minutes secondes
-    - Lance StatArbStrategy.update() à chaque barre
-    - Met à jour SharedState en temps réel
+    Runs in a daemon thread with its own asyncio event loop.
+    - Single WS connection for allMids, optional l2Book + trades
+    - Dispatches each bar to all enabled StrategySlots
+    - Applies cost-aware filter before each portfolio rebalance
+    - Logs turnover + fees per strategy per bar
     """
 
     def __init__(self, state: SharedState, cfg: Dict[str, Any]) -> None:
@@ -305,8 +508,9 @@ class BackgroundEngine:
         self._loop  = asyncio.new_event_loop()
         self._stop  = False
         self._thread = threading.Thread(
-            target=self._run_thread, daemon=True, name="HL-PaperEngine"
+            target=self._run_thread, daemon=True, name="HL-MultiStratEngine"
         )
+        self._rebalancer = CostAwareRebalancer()
 
     def start(self) -> None:
         self._thread.start()
@@ -317,27 +521,32 @@ class BackgroundEngine:
     def is_alive(self) -> bool:
         return self._thread.is_alive()
 
-    # ── Thread entry point ──────────────────────────────────────────────────
-
     def _run_thread(self) -> None:
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._run_async())
         except Exception as exc:
             with self.state._lock:
-                self.state.status = "error"
-                self.state.error  = str(exc)
-
-    # ── Async main ──────────────────────────────────────────────────────────
+                self.state.global_status = "error"
+                self.state.error         = str(exc)
 
     async def _run_async(self) -> None:
         with self.state._lock:
-            self.state.status = "connecting"
-            self.state.error  = ""
+            self.state.global_status = "connecting"
+            self.state.error = ""
 
-        # ── Clients Hyperliquid ──
+        cfg      = self.cfg
+        network  = cfg["network"]
+        selected = cfg["selected"]
+        tf_sec   = cfg["tf_seconds"]
+        h_bars   = _horizon_bars(tf_sec)
+        init_eq  = cfg["initial_equity"]
+        gross_lev = cfg["gross_leverage"]
+        enabled_strats = cfg.get("enabled_strategies", {})
+
+        # ── Clients Hyperliquid ────────────────────────────────────────────────
         ep  = (HyperliquidEndpoints.mainnet()
-               if self.cfg["network"] == "mainnet"
+               if network == "mainnet"
                else HyperliquidEndpoints.testnet())
         rl   = RateLimiter(RateLimiterConfig(weight_budget_per_minute=600))
         rest = HyperliquidRestClient(endpoints=ep, rate_limiter=rl)
@@ -346,46 +555,93 @@ class BackgroundEngine:
 
         await ws_c.start()
 
-        # ── Fetch univers (REST) ──
+        # ── Fetch universe ────────────────────────────────────────────────────
         try:
             meta     = await mkt.meta()
             universe = sorted([a["name"] for a in meta.get("universe", [])])
         except Exception:
             universe = FALLBACK_COINS
 
-        selected = self.cfg["selected"]
-        tf_sec   = self.cfg["tf_seconds"]
-        h_bars   = _horizon_bars(tf_sec)
+        # ── Initialize strategies ─────────────────────────────────────────────
+        per_strat_eq = init_eq  # each strategy gets full capital (independent portfolios)
+
+        slots: Dict[str, StrategySlot] = {}
+        for strat_name, (factory_fn, default_on) in _STRATEGY_REGISTRY.items():
+            should_enable = enabled_strats.get(strat_name, default_on)
+            agent = factory_fn()
+            # Propagate tf_seconds to StatArbMRWrapper
+            if isinstance(agent, _StatArbMRWrapper):
+                agent._tf_seconds = tf_sec
+                agent._init_strategy()
+            portfolio = PaperPortfolio(initial_equity=per_strat_eq, gross_leverage=gross_lev)
+            slot = StrategySlot(name=strat_name, agent=agent, portfolio=portfolio, enabled=should_enable)
+            slots[strat_name] = slot
 
         with self.state._lock:
             self.state.universe      = universe
             self.state.selected      = selected
-            self.state.initial_equity = self.cfg["initial_equity"]
-            self.state.equity         = self.cfg["initial_equity"]
+            self.state.initial_equity = init_eq
+            self.state.gross_leverage = gross_lev
             self.state.tf_seconds     = tf_sec
             self.state.horizon_bars   = h_bars
-            self.state.status         = "warming_up"
+            self.state.global_status  = "warming_up"
+            self.state.strategies     = slots
+            self.state.config         = dict(cfg)
 
-        # ── Stratégie + portfolio ──
-        strategy  = StatArbStrategy(StatArbConfig(
-            timeframe_minutes=max(1, tf_sec // 60),
-            horizon_bars=h_bars,
-        ))
-        buckets   = {"live": selected}
-        portfolio = PaperPortfolio(
-            initial_equity=self.cfg["initial_equity"],
-            gross_leverage=self.cfg["gross_leverage"],
-        )
+        # ── Shared data buffers ────────────────────────────────────────────────
+        latest_mids: Dict[str, float]         = {}
+        latest_ob: Dict[str, Dict]            = {}     # for OB imbalance
+        latest_trades: Dict[str, deque]       = {}     # for liquidation reversion
+        latest_funding: Dict[str, float]      = {}
+        last_bar_ts: Optional[datetime]       = None
+        buckets                               = {"live": selected}
+        ob_subscriptions_done                 = False
 
-        # ── État interne du bar builder ──
-        latest_mids: Dict[str, float]   = {}
-        last_bar_ts: Optional[datetime] = None
+        # ── Subscribe to l2Book & trades if needed ────────────────────────────
+        def _maybe_subscribe_extra() -> None:
+            """Called once to subscribe to l2Book/trades for OB/liq strats."""
+            nonlocal ob_subscriptions_done
+            if ob_subscriptions_done:
+                return
+            ob_needed  = slots.get("OB Imbalance", StrategySlot.__new__(StrategySlot)).enabled if "OB Imbalance" in slots else False
+            liq_needed = slots.get("Liquidation Reversion", StrategySlot.__new__(StrategySlot)).enabled if "Liquidation Reversion" in slots else False
 
-        # ── Callback WebSocket allMids ──
+            if ob_needed or liq_needed:
+                ob_subscriptions_done = True  # mark before scheduling to avoid double-subscribe
+
+                async def _subscribe_extras_async() -> None:
+                    for sym in selected[:10]:   # limit to 10 coins to avoid WS sub limit
+                        if ob_needed:
+                            try:
+                                await mkt.stream_l2_book(sym, cb=lambda msg, s=sym: _on_l2book(msg, s))
+                            except Exception:
+                                pass
+                        if liq_needed:
+                            try:
+                                await mkt.stream_trades(sym, cb=lambda msg, s=sym: _on_trades(msg, s))
+                            except Exception:
+                                pass
+
+                asyncio.ensure_future(_subscribe_extras_async(), loop=self._loop)
+
+        def _on_l2book(msg: Any, sym: str) -> None:
+            if isinstance(msg, dict):
+                data = msg.get("data", msg)
+                latest_ob[sym] = data
+
+        def _on_trades(msg: Any, sym: str) -> None:
+            if isinstance(msg, dict):
+                data = msg.get("data", msg)
+                if isinstance(data, list):
+                    if sym not in latest_trades:
+                        latest_trades[sym] = deque(maxlen=50)
+                    for t in data:
+                        latest_trades[sym].append(t)
+
+        # ── Callback WebSocket allMids ────────────────────────────────────────
         def _on_mids(msg: Any) -> None:
             nonlocal latest_mids, last_bar_ts
 
-            # Extraction du dict de prix depuis les différentes formes possibles
             if isinstance(msg, dict):
                 data = msg.get("data", msg)
                 raw  = data.get("mids", data) if isinstance(data, dict) else {}
@@ -403,7 +659,10 @@ class BackgroundEngine:
                 self.state.mids        = {s: latest_mids[s] for s in selected if s in latest_mids}
                 self.state.last_update = now
 
-            # ── Déclenchement d'une barre ──
+            # ── Subscribe extras on first good mids (avoids subscribe before connected) ──
+            _maybe_subscribe_extra()
+
+            # ── Trigger bar ───────────────────────────────────────────────────
             if last_bar_ts is not None and (now - last_bar_ts).total_seconds() < tf_sec:
                 return
             last_bar_ts = now
@@ -416,60 +675,122 @@ class BackgroundEngine:
             if len(bar_mids) < MIN_BAR_COINS:
                 return
 
-            # ── Signal stratégie ──
-            signal = strategy.update(now, bar_mids, buckets)
+            context = AgentContext(
+                selected=selected,
+                buckets=buckets,
+                funding_rates=dict(latest_funding),
+                ob_snapshots=dict(latest_ob),
+                trade_history={s: deque(list(v)) for s, v in latest_trades.items()},
+            )
 
-            # Normalise les poids au gross leverage cible
-            raw_w   = signal.weights_raw
-            total_w = sum(abs(w) for w in raw_w.values())
-            if total_w > 1e-9:
-                scale = portfolio.gross_leverage / total_w
-                norm_w = {k: v * scale for k, v in raw_w.items()}
-            else:
-                norm_w = raw_w
-
-            # ── Rebalance portfolio paper ──
-            portfolio.rebalance(norm_w, bar_mids)
-
-            total_eq   = portfolio.total_equity(bar_mids)
-            n_bars_new = (self.state.n_bars or 0) + 1
-            new_status = "live" if n_bars_new >= h_bars else "warming_up"
-            positions  = portfolio.positions_snapshot(bar_mids, signal.zscores, norm_w)
+            # ── Dispatch to all enabled strategy slots ────────────────────────
+            any_live = False
 
             with self.state._lock:
-                self.state.equity_history.append((now.isoformat(), total_eq))
-                self.state.equity       = total_eq
-                self.state.zscores      = dict(signal.zscores)
-                self.state.weights      = dict(norm_w)
-                self.state.signal_ts    = now
-                self.state.positions    = positions
-                self.state.n_bars       = n_bars_new
-                self.state.n_wins       = portfolio.n_wins
-                self.state.n_losses     = portfolio.n_losses
-                self.state.realized_pnl = portfolio.realized_pnl
-                self.state.total_fees   = portfolio.total_fees
-                self.state.status       = new_status
+                active_slots = [slot for slot in slots.values() if slot.enabled]
 
-        # ── Souscription WebSocket ──
+            for slot in active_slots:
+                try:
+                    output = slot.agent.update(now, bar_mids, context)
+                    slot.n_bars += 1
+
+                    if not slot.agent.is_warmed_up:
+                        slot.status = "warming_up"
+                        continue
+
+                    # ── Cost-aware filter ─────────────────────────────────────
+                    current_w = slot.portfolio.current_weights(bar_mids)
+                    filtered_w = self._rebalancer.filter_trades(
+                        output.weights, current_w, bar_mids, slot.portfolio.total_equity(bar_mids)
+                    )
+
+                    # Normalize to gross leverage
+                    total_w = sum(abs(w) for w in filtered_w.values())
+                    if total_w > 1e-9:
+                        scale = gross_lev / total_w
+                        norm_w = {k: v * scale for k, v in filtered_w.items()}
+                    else:
+                        norm_w = {}
+
+                    # ── Rebalance portfolio ───────────────────────────────────
+                    slot.portfolio.rebalance(norm_w, bar_mids)
+
+                    total_eq = slot.portfolio.total_equity(bar_mids)
+
+                    # ── Log turnover + fees per bar ───────────────────────────
+                    turnover = self._rebalancer.compute_bar_turnover(
+                        slot.last_bar_weights, norm_w
+                    )
+                    slot.turnover_history.append((now.isoformat(), turnover))
+                    slot.fee_history.append((now.isoformat(), slot.portfolio.fees_this_bar))
+                    slot.last_bar_weights = dict(norm_w)
+
+                    # ── Update slot state ─────────────────────────────────────
+                    slot.equity_history.append((now.isoformat(), total_eq))
+                    slot.last_weights = dict(norm_w)
+                    slot.last_zscores = dict(output.zscores)
+                    slot.last_meta    = dict(output.meta)
+                    slot.positions    = slot.portfolio.positions_snapshot(
+                        bar_mids, output.zscores, norm_w
+                    )
+                    slot.status = "live"
+                    any_live = True
+
+                except Exception as exc:
+                    slot.status = "error"
+                    slot.last_meta = {"error": str(exc)}
+
+            with self.state._lock:
+                if any_live:
+                    self.state.global_status = "live"
+                elif self.state.global_status == "warming_up":
+                    pass  # keep warming_up
+
+        # ── Funding rate polling (async background task) ──────────────────────
+        async def _poll_funding() -> None:
+            while not self._stop:
+                try:
+                    resp = await mkt.meta_and_asset_ctxs()
+                    # HL format: [meta_dict, [asset_ctx_dict, ...]]
+                    if isinstance(resp, list) and len(resp) == 2:
+                        meta_info = resp[0]
+                        asset_ctxs = resp[1]
+                        assets = meta_info.get("universe", [])
+                        for i, asset in enumerate(assets):
+                            sym = asset.get("name", "")
+                            if sym in selected and i < len(asset_ctxs):
+                                ctx = asset_ctxs[i]
+                                funding = ctx.get("funding", "0")
+                                try:
+                                    latest_funding[sym] = float(funding)
+                                except (ValueError, TypeError):
+                                    pass
+                    with self.state._lock:
+                        self.state.funding_rates = dict(latest_funding)
+                except Exception:
+                    pass
+                await asyncio.sleep(FUNDING_POLL_S)
+
+        # ── Start async tasks ─────────────────────────────────────────────────
+        asyncio.ensure_future(_poll_funding(), loop=self._loop)
         await mkt.stream_all_mids(_on_mids)
 
-        # ── Boucle principale (maintient le thread vivant) ──
+        # ── Keep-alive loop ───────────────────────────────────────────────────
         while not self._stop:
             await asyncio.sleep(1.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS  (sync fetch univers + utilitaires visuels)
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_universe(network: str) -> List[str]:
-    """Appel HTTP synchrone pour récupérer l'univers depuis Hyperliquid (mis en cache 1h)."""
     try:
         import httpx
-        url  = ("https://api.hyperliquid.xyz/info"
-                if network == "mainnet"
-                else "https://api.hyperliquid-testnet.xyz/info")
+        url = ("https://api.hyperliquid.xyz/info"
+               if network == "mainnet"
+               else "https://api.hyperliquid-testnet.xyz/info")
         resp = httpx.post(url, json={"type": "meta"}, timeout=8.0)
         return sorted([a["name"] for a in resp.json().get("universe", [])])
     except Exception:
@@ -481,11 +802,11 @@ def _badge(status: str) -> str:
         "live"       : "🟢 LIVE",
         "connecting" : "🔵 CONNECTING",
         "warming_up" : "🟡 WARMING UP",
+        "stopped"    : "⚫ STOPPED",
         "error"      : "🔴 ERROR",
         "idle"       : "⚫ IDLE",
     }
-    return (f'<span class="badge-{status}">'
-            f'{icons.get(status, status.upper())}</span>')
+    return f'<span class="badge-{status}">{icons.get(status, status.upper())}</span>'
 
 
 def _pct(v: float, d: int = 2) -> str:
@@ -496,70 +817,59 @@ def _fmt(v: float, d: int = 2) -> str:
     return f"{v:,.{d}f}" if math.isfinite(v) else "—"
 
 
-def _compute_metrics(equity_history: list, initial: float, snap: Dict) -> Dict:
+def _compute_metrics(equity_history: list, initial: float, tf_seconds: int,
+                     n_wins: int = 0, n_losses: int = 0) -> Dict[str, float]:
     if len(equity_history) < 2 or initial <= 0:
         return {}
     eq   = np.array([e for _, e in equity_history], dtype=float)
     rets = np.diff(np.log(np.clip(eq, 1e-9, None)))
-
     peak   = np.maximum.accumulate(eq)
     max_dd = float(((eq - peak) / (peak + 1e-9)).min()) * 100
-
-    bars_per_year = 365 * 24 * 3600 / max(snap.get("tf_seconds", 300), 1)
+    bars_per_year = 365 * 24 * 3600 / max(tf_seconds, 1)
     sharpe = (float(rets.mean() / rets.std() * np.sqrt(bars_per_year))
               if len(rets) > 1 and rets.std() > 0 else 0.0)
-
-    n_trades = snap.get("n_wins", 0) + snap.get("n_losses", 0)
+    n_trades = n_wins + n_losses
     return {
         "total_return_pct": float((eq[-1] / initial - 1) * 100),
         "max_dd_pct"      : float(max_dd),
         "sharpe"          : float(sharpe),
-        "win_rate"        : snap.get("n_wins", 0) / n_trades if n_trades > 0 else 0.0,
+        "win_rate"        : n_wins / n_trades if n_trades > 0 else 0.0,
         "n_trades"        : n_trades,
     }
 
 
-def _plot_pnl_chart(
-    equity_history: list,
-    initial: float,
-    total_fees: float,
-) -> None:
-    """
-    Courbe PnL live :
-      - PnL net  = equity(t) - initial  (après frais)
-      - PnL brut = PnL net + total_fees cumulés (proxy sans market impact)
-      - Drawdown (subplot bas)
-    """
+def _plot_pnl_chart(equity_history: list, initial: float, total_fees: float,
+                    color: str = "#2ecc71", label: str = "") -> None:
     if len(equity_history) < 2:
         st.info("En attente de données — warmup en cours...")
         return
-
     ts_   = [datetime.fromisoformat(t) for t, _ in equity_history]
     eq_   = np.array([e for _, e in equity_history], dtype=float)
     pnl_net   = eq_ - initial
-    pnl_gross = pnl_net + total_fees          # frais ré-ajoutés = gross
+    pnl_gross = pnl_net + total_fees
     peak      = np.maximum.accumulate(eq_)
     dd        = (eq_ - peak) / (peak + 1e-9) * 100
 
+    title_suffix = f" — {label}" if label else ""
+
     if go is None or make_subplots is None:
-        df = pd.DataFrame({"PnL net ($)": pnl_net, "PnL brut ($)": pnl_gross}, index=ts_)
+        df = pd.DataFrame({"PnL net ($)": pnl_net}, index=ts_)
         st.line_chart(df)
         return
 
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
         row_heights=[0.68, 0.32], vertical_spacing=0.04,
-        subplot_titles=("PnL ($)", "Drawdown (%)"),
+        subplot_titles=(f"PnL ($){title_suffix}", "Drawdown (%)"),
     )
     fig.add_trace(
         go.Scatter(x=ts_, y=pnl_gross, name="PnL brut (avant frais)",
                    line=dict(color="#7289da", width=1.5, dash="dot")), row=1, col=1
     )
     fig.add_trace(
-        go.Scatter(x=ts_, y=pnl_net, name="PnL net (après frais)",
-                   line=dict(color="#2ecc71", width=2),
-                   fill="tozeroy",
-                   fillcolor="rgba(46,204,113,0.08)"), row=1, col=1
+        go.Scatter(x=ts_, y=pnl_net, name="PnL net",
+                   line=dict(color=color, width=2),
+                   fill="tozeroy", fillcolor=f"rgba{_hex_to_rgba(color, 0.08)}"), row=1, col=1
     )
     fig.add_hline(y=0, line_dash="dash", line_color="#555", row=1, col=1)
     fig.add_trace(
@@ -568,7 +878,7 @@ def _plot_pnl_chart(
                    fillcolor="rgba(231,76,60,0.15)"), row=2, col=1
     )
     fig.update_layout(
-        template="plotly_dark", height=400,
+        template="plotly_dark", height=380,
         margin=dict(l=10, r=10, t=40, b=10),
         legend=dict(orientation="h", y=1.07),
         yaxis=dict(tickprefix="$"),
@@ -577,52 +887,61 @@ def _plot_pnl_chart(
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _plot_zscores(zscores: Dict[str, float]) -> None:
+def _plot_turnover_chart(turnover_history: list, fee_history: list, color: str = "#f39c12") -> None:
+    if len(turnover_history) < 2:
+        return
+    ts_  = [datetime.fromisoformat(t) for t, _ in turnover_history]
+    to_  = [v for _, v in turnover_history]
+    fee_ = [v for _, v in fee_history] if fee_history else [0.0] * len(to_)
+
+    if go is None:
+        df = pd.DataFrame({"Turnover": to_}, index=ts_)
+        st.line_chart(df)
+        return
+
+    fig = make_subplots(rows=1, cols=1)
+    fig.add_trace(go.Bar(x=ts_, y=to_, name="Turnover", marker_color=color, opacity=0.7))
+    fig.add_trace(go.Bar(x=ts_, y=fee_, name="Frais ($)", marker_color="#e74c3c", opacity=0.6))
+    fig.update_layout(
+        template="plotly_dark", height=220, barmode="overlay",
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h", y=1.05),
+        title="Turnover par barre (et frais $)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _plot_zscores(zscores: Dict[str, float], color: str = "#e74c3c") -> None:
     if not zscores:
         st.info("Z-scores disponibles après le warmup...")
         return
-    syms   = sorted(zscores, key=lambda s: abs(zscores[s]), reverse=True)[:20]
-    vals   = [zscores[s] for s in syms]
-    colors = ["#e74c3c" if v > 0 else "#2ecc71" for v in vals]
-
+    syms = sorted(zscores, key=lambda s: abs(zscores[s]), reverse=True)[:20]
+    vals = [zscores[s] for s in syms]
+    colors_bar = [color if v > 0 else "#2ecc71" for v in vals]
     if go is None:
         st.bar_chart(pd.Series(vals, index=syms))
         return
-
-    fig = go.Figure(go.Bar(x=syms, y=vals, marker_color=colors))
-    fig.add_hline(y=1.5,  line_dash="dash", line_color="#f39c12",
-                  annotation_text="z_in = 1.5")
+    fig = go.Figure(go.Bar(x=syms, y=vals, marker_color=colors_bar))
+    fig.add_hline(y=1.5, line_dash="dash", line_color="#f39c12", annotation_text="z_in")
     fig.add_hline(y=-1.5, line_dash="dash", line_color="#f39c12")
     fig.update_layout(
-        template="plotly_dark", height=300,
+        template="plotly_dark", height=270,
         margin=dict(l=10, r=10, t=30, b=40),
-        title="Z-scores intra-panier (rouge → short candidat | vert → long candidat)",
     )
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _plot_weights(weights: Dict[str, float]) -> None:
-    if not weights:
-        return
-    syms   = sorted(weights, key=lambda s: abs(weights[s]), reverse=True)[:20]
-    vals   = [weights[s] for s in syms]
-    colors = ["#e74c3c" if v > 0 else "#2ecc71" for v in vals]
-
-    if go is None:
-        st.bar_chart(pd.Series(vals, index=syms))
-        return
-
-    fig = go.Figure(go.Bar(x=syms, y=vals, marker_color=colors))
-    fig.update_layout(
-        template="plotly_dark", height=300,
-        margin=dict(l=10, r=10, t=30, b=40),
-        title="Poids alloués (rouge = short | vert = long)",
-    )
-    st.plotly_chart(fig, use_container_width=True)
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    """Convert '#rrggbb' → '(r,g,b,a)' string for plotly."""
+    h = hex_color.lstrip("#")
+    if len(h) == 6:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"({r},{g},{b},{alpha})"
+    return f"(46,204,113,{alpha})"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SESSION STATE
+# SESSION STATE INITIALIZATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 if "hl_state"  not in st.session_state:
@@ -631,340 +950,559 @@ if "hl_engine" not in st.session_state:
     st.session_state.hl_engine = None
 if "hl_cfg"    not in st.session_state:
     st.session_state.hl_cfg    = None
-if "hl_tf_s"   not in st.session_state:
-    st.session_state.hl_tf_s   = TF_OPTIONS[TF_DEFAULT]
+# Per-strategy enabled flags (persists across reruns)
+if "strat_enabled" not in st.session_state:
+    st.session_state.strat_enabled = {
+        name: default_on
+        for name, (_, default_on) in _STRATEGY_REGISTRY.items()
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR — Configuration & contrôles
+# SIDEBAR — Configuration & Strategy Controls
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("### 🔴 HyperStat Live")
+    st.markdown("### 🔴 HyperStat Multi-Strategy")
     st.divider()
 
+    # ── Réseau ────────────────────────────────────────────────────────────────
     st.subheader("Réseau")
     network = st.radio("Réseau", ["mainnet", "testnet"], index=0,
                        horizontal=True, label_visibility="collapsed")
 
-    st.subheader("Sélection des coins")
-    with st.spinner("Chargement de l'univers..."):
+    # ── Coins ─────────────────────────────────────────────────────────────────
+    st.subheader("Coins")
+    with st.spinner("Chargement univers..."):
         universe_list = _fetch_universe(network)
-
-    defaults = [c for c in ["BTC", "ETH", "SOL", "AVAX", "LINK", "ARB", "OP"]
+    defaults = [c for c in ["BTC", "ETH", "SOL", "AVAX", "LINK", "ARB", "OP", "NEAR", "FTM", "ATOM"]
                 if c in universe_list]
     selected_coins = st.multiselect(
-        "Coins à inclure dans le panier",
-        options=universe_list,
-        default=defaults,
+        "Coins dans le panier",
+        options=universe_list, default=defaults,
         help="Min. 2 coins. Z-scores calculés intra-panier.",
     )
 
-    st.subheader("Stratégie")
-    tf_label   = st.selectbox(
+    # ── Config globale ────────────────────────────────────────────────────────
+    st.subheader("Configuration")
+    tf_label = st.selectbox(
         "Timeframe barre", list(TF_OPTIONS.keys()),
         index=list(TF_OPTIONS.keys()).index(TF_DEFAULT),
-        help="Durée d'une barre — de 10 secondes à 1 heure",
+        help="Durée d'une barre — de 10s à 1h",
     )
     tf_seconds_sel = TF_OPTIONS[tf_label]
     h_bars_disp    = _horizon_bars(tf_seconds_sel)
-    st.caption(f"Warmup : {h_bars_disp} barres ≈ "
-               f"{h_bars_disp * tf_seconds_sel // 60} min")
+    st.caption(f"Warmup : {h_bars_disp} barres ≈ {h_bars_disp * tf_seconds_sel // 60} min")
 
-    initial_equity  = st.number_input("Capital initial ($)", min_value=100.0,
-                                      max_value=1_000_000.0, value=DEFAULT_EQUITY, step=1000.0)
-    gross_leverage  = st.slider("Gross leverage", 0.1, 3.0, DEFAULT_GROSS_LEV, 0.1,
-                                help="Exposition totale (1.5 = 150% du capital) — no market impact")
+    initial_equity = st.number_input("Capital / stratégie ($)", min_value=100.0,
+                                     max_value=1_000_000.0, value=DEFAULT_EQUITY, step=1000.0)
+    gross_leverage = st.slider("Gross leverage", 0.1, 3.0, DEFAULT_GROSS_LEV, 0.1,
+                               help="Exposition totale par stratégie (1.5 = 150%)")
 
+    # ── Stratégies ────────────────────────────────────────────────────────────
+    st.subheader("Stratégies")
+    st.caption("🟢 ON par défaut | ⚫ OFF par défaut (6-7) | ⏹ Kill | ▶ Start | 🔄 Restart")
+
+    engine_for_strats = st.session_state.hl_engine
+    is_running_strats = engine_for_strats is not None and engine_for_strats.is_alive()
+    # Snapshot current slot statuses for button rendering (read once, thread-safe)
+    _snap_for_buttons = st.session_state.hl_state.snapshot()
+
+    for strat_name in _STRATEGY_REGISTRY:
+        slot_snap   = _snap_for_buttons["strategies"].get(strat_name, {})
+        slot_status = slot_snap.get("status", "idle")
+        slot_active = slot_status in ("live", "warming_up")
+
+        c1, c2, c3 = st.columns([4, 1, 1])
+        with c1:
+            enabled = st.toggle(
+                strat_name,
+                value=st.session_state.strat_enabled.get(strat_name, False),
+                key=f"tog_{strat_name}",
+            )
+            st.session_state.strat_enabled[strat_name] = enabled
+
+        if is_running_strats:
+            with c2:
+                # ⏹ Kill (if active) / ▶ Start (if stopped/idle)
+                if slot_active:
+                    if st.button("⏹", key=f"stop_{strat_name}",
+                                 help=f"Kill {strat_name} — arrête les trades, conserve l'historique"):
+                        with st.session_state.hl_state._lock:
+                            slot = st.session_state.hl_state.strategies.get(strat_name)
+                            if slot:
+                                slot.enabled = False
+                                slot.status  = "stopped"
+                        st.session_state.strat_enabled[strat_name] = False
+                        st.rerun()
+                else:
+                    if st.button("▶", key=f"start_{strat_name}",
+                                 help=f"Démarrer {strat_name} — reprend sans reset de l'historique"):
+                        with st.session_state.hl_state._lock:
+                            slot = st.session_state.hl_state.strategies.get(strat_name)
+                            if slot:
+                                slot.enabled = True
+                                if slot.status in ("stopped", "idle"):
+                                    slot.status = "warming_up"
+                        st.session_state.strat_enabled[strat_name] = True
+                        st.rerun()
+
+            with c3:
+                if st.button("🔄", key=f"rst_{strat_name}",
+                             help=f"Restart {strat_name} — reset état + nouveau PaperPortfolio"):
+                    with st.session_state.hl_state._lock:
+                        slot = st.session_state.hl_state.strategies.get(strat_name)
+                        if slot:
+                            slot.agent.reset()
+                            slot.portfolio = PaperPortfolio(
+                                initial_equity=st.session_state.hl_state.initial_equity,
+                                gross_leverage=st.session_state.hl_state.gross_leverage,
+                            )
+                            slot.equity_history.clear()
+                            slot.turnover_history.clear()
+                            slot.fee_history.clear()
+                            slot.last_weights    = {}
+                            slot.last_bar_weights = {}
+                            slot.n_bars  = 0
+                            slot.status  = "warming_up"
+                            slot.enabled = True   # re-enable if it was killed
+                    st.session_state.strat_enabled[strat_name] = True
+                    st.rerun()
+
+    st.divider()
+
+    # ── Refresh ───────────────────────────────────────────────────────────────
     st.subheader("Refresh UI")
     auto_refresh = st.toggle("Auto-refresh", value=True)
     refresh_s    = st.number_input("Intervalle (sec)", min_value=2, max_value=30,
                                    value=3, step=1, disabled=not auto_refresh)
 
-    st.divider()
-
-    # ── Config courante ──
+    # ── Build config ──────────────────────────────────────────────────────────
     cfg = {
-        "network"       : network,
-        "selected"      : selected_coins,
-        "tf_seconds"    : tf_seconds_sel,
-        "initial_equity": initial_equity,
-        "gross_leverage": gross_leverage,
+        "network"            : network,
+        "selected"           : selected_coins,
+        "tf_seconds"         : tf_seconds_sel,
+        "initial_equity"     : initial_equity,
+        "gross_leverage"     : gross_leverage,
+        "enabled_strategies" : dict(st.session_state.strat_enabled),
     }
 
-    engine     = st.session_state.hl_engine
-    is_running = engine is not None and engine.is_alive()
+    is_running = st.session_state.hl_engine is not None and st.session_state.hl_engine.is_alive()
 
+    st.divider()
     if not is_running:
-        if st.button("▶️ Lancer le paper trading", type="primary",
+        if st.button("▶️ Lancer", type="primary",
                      use_container_width=True, disabled=len(selected_coins) < 2):
-            new_state  = SharedState()
+            new_state  = SharedState(initial_equity=initial_equity, gross_leverage=gross_leverage)
             new_engine = BackgroundEngine(new_state, cfg)
             new_engine.start()
             st.session_state.hl_state  = new_state
             st.session_state.hl_engine = new_engine
             st.session_state.hl_cfg    = cfg
-            st.session_state.hl_tf_s   = tf_seconds_sel
             st.rerun()
     else:
-        col_stop, col_restart = st.columns(2)
-        with col_stop:
+        c_stop, c_reload = st.columns(2)
+        with c_stop:
             if st.button("⏹️ Stop", use_container_width=True):
-                engine.stop()
+                st.session_state.hl_engine.stop()
                 st.session_state.hl_engine = None
                 st.session_state.hl_state  = SharedState()
                 st.rerun()
-        with col_restart:
-            if st.button("🔄 Relancer", use_container_width=True,
-                         help="Applique la nouvelle config"):
-                engine.stop()
-                new_state  = SharedState()
+        with c_reload:
+            if st.button("⟳ Reload Config", use_container_width=True,
+                         help="Relance avec la nouvelle config (timeframe, coins, capital, stratégies actives)"):
+                st.session_state.hl_engine.stop()
+                new_state  = SharedState(initial_equity=initial_equity, gross_leverage=gross_leverage)
                 new_engine = BackgroundEngine(new_state, cfg)
                 new_engine.start()
                 st.session_state.hl_state  = new_state
                 st.session_state.hl_engine = new_engine
                 st.session_state.hl_cfg    = cfg
-                st.session_state.hl_tf_s   = tf_seconds_sel
                 st.rerun()
 
-    # Statut affiché dans la sidebar
+    # Statut sidebar
     snap_sb = st.session_state.hl_state.snapshot()
-    st.markdown(f"**Statut** &nbsp; {_badge(snap_sb['status'])}", unsafe_allow_html=True)
+    st.markdown(f"**Statut** &nbsp; {_badge(snap_sb['global_status'])}", unsafe_allow_html=True)
     if snap_sb["error"]:
         st.error(snap_sb["error"])
     if snap_sb["last_update"]:
         age = (datetime.now(timezone.utc) - snap_sb["last_update"]).total_seconds()
-        st.caption(f"Dernière MAJ: {age:.0f}s | Barres: {snap_sb['n_bars']}/{snap_sb['horizon_bars']}")
+        active_cnt = sum(1 for s in snap_sb["strategies"].values() if s["enabled"])
+        live_cnt   = sum(1 for s in snap_sb["strategies"].values() if s["status"] == "live")
+        st.caption(f"MAJ: {age:.0f}s | {live_cnt}/{active_cnt} strats LIVE")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN CONTENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-snap    = st.session_state.hl_state.snapshot()
-tf_s    = snap["tf_seconds"]    # secondes/barre (depuis SharedState)
-h_bars  = snap["horizon_bars"]  # barres warmup (depuis SharedState)
+snap = st.session_state.hl_state.snapshot()
+tf_s = snap["tf_seconds"]
 tf_label_disp = next((k for k, v in TF_OPTIONS.items() if v == tf_s), f"{tf_s}s")
 
-# ── Header ────────────────��────────────���────────────────────────────────────
-col_t, col_s, col_eq, col_ret, col_dd = st.columns([3, 2, 2, 2, 2])
-
+# ── Header ────────────────────────────────────────────────────────────────────
+col_t, col_s, col_active, col_live = st.columns([3, 2, 2, 2])
 with col_t:
-    st.markdown("## 🔴 Live Paper Trading — Hyperliquid")
-
+    st.markdown("## 🔴 HyperStat — Live Multi-Strategy")
 with col_s:
-    st.markdown(f"**Statut** &nbsp; {_badge(snap['status'])}", unsafe_allow_html=True)
+    st.markdown(f"**Statut** &nbsp; {_badge(snap['global_status'])}", unsafe_allow_html=True)
     if snap["last_update"]:
         st.caption(snap["last_update"].strftime("%H:%M:%S UTC"))
+with col_active:
+    active_strats = [s for s, v in snap["strategies"].items() if v["enabled"]]
+    st.metric("Strats actives", str(len(active_strats)))
+with col_live:
+    live_strats = [s for s, v in snap["strategies"].items() if v["status"] == "live"]
+    st.metric("Strats LIVE", str(len(live_strats)))
 
-with col_eq:
-    eq = snap["equity"]
-    st.metric("Equity", f"${eq:,.2f}" if math.isfinite(eq) else "—")
-
-with col_ret:
-    init = snap["initial_equity"]
-    ret  = (eq / init - 1) * 100 if (init > 0 and math.isfinite(eq)) else 0.0
-    st.metric("Retour total", _pct(ret))
-
-with col_dd:
-    eq_h = snap["equity_history"]
-    if len(eq_h) >= 2:
-        eq_arr = np.array([e for _, e in eq_h])
-        peak   = np.maximum.accumulate(eq_arr)
-        cur_dd = float((eq_arr[-1] - peak[-1]) / (peak[-1] + 1e-9) * 100)
-        st.metric("Drawdown courant", _pct(cur_dd))
-    else:
-        st.metric("Drawdown courant", "—")
-
-# ── Idle screen ────────────────────────────────────���────────────────────────
-if snap["status"] == "idle":
+# ── Idle screen ───────────────────────────────────────────────────────────────
+if snap["global_status"] == "idle":
     st.divider()
-    st.info("⬅️ Sélectionne tes coins et clique **Lancer le paper trading** dans le sidebar.")
+    st.info("⬅️ Sélectionne les stratégies à activer et clique **Lancer** dans le sidebar.")
     st.markdown("""
-    **Fonctionnement :**
-    1. Connexion au WebSocket Hyperliquid — récupération des prix en temps réel pour **n'importe quel coin listé**
-    2. Formation de barres toutes les N minutes (paramétrable)
-    3. Calcul des **z-scores stat-arb** intra-panier → signaux long/short contrarians
-    4. **Paper trading** : simulation de trades au prix mid avec frais réalistes (3.5 bps)
-    5. Suivi du PnL, drawdown, positions en temps réel
+**Architecture Multi-Stratégie :**
+- Chaque stratégie a son propre **PaperPortfolio indépendant** (capital séparé)
+- Toutes les stratégies partagent un **seul flux WebSocket Hyperliquid** (pas de re-téléchargement)
+- Filtre **cost-aware** global : `trade only if edge > 2*(fee+slip)+buffer` (30 bps)
+- **Start/Stop/Restart** par stratégie sans interruption du flux de données
+
+**Stratégies disponibles :**
+| # | Nom | Type | Turnover | Défaut |
+|---|-----|------|----------|--------|
+| 1 | Stat-Arb MR + FDS | Mean-Reversion | Moyen | ON |
+| 2 | Cross-Section Momentum | Momentum | Faible | ON |
+| 3 | Funding Carry Pure | Carry | Très faible | ON |
+| 4 | PCA Residual MR | Mean-Reversion | Moyen | ON |
+| 5 | Quality / Liquidity | Factor | Très faible | ON |
+| 6 | Liquidation Reversion | Event-driven | Rare | **OFF** |
+| 7 | OB Imbalance | Microstructure | Élevé | **OFF** |
     """)
     st.stop()
 
-# ── Barre de warmup ─────────────────────────────────────────────────────────
-if snap["status"] == "warming_up":
-    n        = snap["n_bars"]
-    rem_sec  = max(0, (h_bars - n) * tf_s)
-    rem_str  = f"{rem_sec // 60}min {rem_sec % 60}s" if rem_sec >= 60 else f"{rem_sec}s"
-    st.progress(
-        min(1.0, n / max(h_bars, 1)),
-        text=f"🟡 WARMING UP — {n}/{h_bars} barres de {tf_label_disp} collectées "
-             f"(~{rem_str} restantes)"
-    )
-elif snap["status"] == "connecting":
-    st.progress(0.0, text="🔵 Connexion au WebSocket Hyperliquid...")
+# ── Warmup progress ────────────────────────────────────────────────────────────
+if snap["global_status"] in ("warming_up", "connecting"):
+    warming_strats = {
+        name: s for name, s in snap["strategies"].items()
+        if s["enabled"] and s["status"] in ("warming_up", "connecting")
+    }
+    if snap["global_status"] == "connecting":
+        st.progress(0.0, text="🔵 Connexion au WebSocket Hyperliquid...")
+    elif warming_strats:
+        # Show worst progress
+        min_pct = min(
+            (s["bars_seen"] / max(s["warmup_bars"], 1))
+            for s in warming_strats.values()
+        )
+        slowest = min(warming_strats, key=lambda n: warming_strats[n]["bars_seen"] / max(warming_strats[n]["warmup_bars"], 1))
+        s = warming_strats[slowest]
+        rem_sec = max(0, (s["warmup_bars"] - s["bars_seen"]) * tf_s)
+        rem_str = f"{rem_sec // 60}min {rem_sec % 60}s" if rem_sec >= 60 else f"{rem_sec}s"
+        st.progress(
+            min(1.0, min_pct),
+            text=f"🟡 WARMING UP — {slowest}: {s['bars_seen']}/{s['warmup_bars']} barres (~{rem_str} restantes)"
+        )
 
 st.divider()
 
-# ── Tabs ───────────────────���────────────────────────────────────────────────
-tab_mkt, tab_sig, tab_pf, tab_pos = st.tabs([
+# ── Tabs ───────────────────────────────────────────────────────────────────────
+tab_mkt, tab_sig, tab_pf, tab_cfg = st.tabs([
     "📈 Marché Live",
-    "📊 Signaux Stratégie",
-    "💰 Portfolio",
-    "📋 Positions",
+    "📊 Signaux",
+    "💼 Portfolio",
+    "⚙️ Config",
 ])
 
 
-# ── TAB : Marché ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB : Marché Live
+# ─────────────────────────────────────────────────────────────────────────────
 with tab_mkt:
     st.markdown('<div class="section-header">📈 Prix en temps réel — Hyperliquid</div>',
                 unsafe_allow_html=True)
-
-    mids    = snap["mids"]
-    zscores = snap["zscores"]
-    weights = snap["weights"]
-
+    mids = snap["mids"]
     if mids:
+        # Collect z-scores from first live strategy for signal column
+        ref_zscores: Dict[str, float] = {}
+        for s in snap["strategies"].values():
+            if s["status"] == "live" and s["zscores"]:
+                ref_zscores = s["zscores"]
+                break
+
         rows = []
         for sym in snap["selected"]:
             px = mids.get(sym)
             if px is None:
                 continue
-            z = zscores.get(sym, 0.0)
-            signal_label = ("🔴 SHORT" if z > 1.5 else "🟢 LONG" if z < -1.5 else "⚪ FLAT")
+            z = ref_zscores.get(sym, 0.0)
             rows.append({
-                "Coin"    : sym,
-                "Prix"    : f"${px:,.4f}" if px < 100 else f"${px:,.2f}",
-                "Z-Score" : f"{z:+.3f}",
-                "Poids"   : f"{weights.get(sym, 0):+.3f}",
-                "Signal"  : signal_label,
+                "Coin"   : sym,
+                "Prix"   : f"${px:,.4f}" if px < 100 else f"${px:,.2f}",
+                "Z-Score": f"{z:+.3f}" if z else "—",
+                "Signal" : ("🔴 SHORT" if z > 1.5 else "🟢 LONG" if z < -1.5 else "⚪ FLAT") if z else "—",
             })
-
         if rows:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            st.caption(f"{len(rows)} coins | Timeframe: {tf_label_disp} | "
-                       f"MAJ: {snap['last_update'].strftime('%H:%M:%S') if snap['last_update'] else '—'} UTC")
+            st.caption(f"{len(rows)} coins | TF: {tf_label_disp} | "
+                       f"MAJ: {snap['last_update'].strftime('%H:%M:%S UTC') if snap['last_update'] else '—'}")
     else:
-        st.info("En attente des premiers prix Hyperliquid (quelques secondes)...")
+        st.info("En attente des premiers prix Hyperliquid...")
 
-    # Nombre de coins dans l'univers
     if snap["universe"]:
-        st.caption(f"Univers total Hyperliquid : **{len(snap['universe'])} coins** disponibles")
+        st.caption(f"Univers Hyperliquid : **{len(snap['universe'])} coins**")
 
 
-# ── TAB : Signaux ────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB : Signaux
+# ─────────────────────────────────────────────────────────────────────────────
 with tab_sig:
-    st.markdown('<div class="section-header">📊 Signaux stat-arb</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-header">📊 Signaux par stratégie</div>', unsafe_allow_html=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("#### Z-Scores intra-panier")
-        _plot_zscores(snap["zscores"])
-    with col2:
-        st.markdown("#### Poids alloués")
-        _plot_weights(snap["weights"])
+    live_strat_names = [name for name, s in snap["strategies"].items()
+                        if s["enabled"] and s["status"] == "live"]
 
-    if snap["signal_ts"]:
-        st.caption(
-            f"Dernier signal: {snap['signal_ts'].strftime('%H:%M:%S UTC')} | "
-            f"Barres traitées: {snap['n_bars']} | "
-            f"Gross leverage: {cfg['gross_leverage']:.1f}x"
-        )
+    if not live_strat_names:
+        st.info("Aucune stratégie LIVE pour le moment (warmup en cours).")
     else:
-        st.info("Les signaux apparaîtront après le warmup.")
+        sel_strat = st.selectbox("Stratégie", live_strat_names, key="sig_sel_strat")
+        if sel_strat:
+            s = snap["strategies"][sel_strat]
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"#### Z-Scores — {sel_strat}")
+                _plot_zscores(s["zscores"], color=STRATEGY_COLORS.get(sel_strat, "#e74c3c"))
+            with col2:
+                st.markdown("#### Poids alloués")
+                weights = s["weights"]
+                if weights:
+                    syms_w = sorted(weights, key=lambda x: abs(weights[x]), reverse=True)[:20]
+                    vals_w = [weights[sym] for sym in syms_w]
+                    colors_w = ["#e74c3c" if v > 0 else "#2ecc71" for v in vals_w]
+                    if go:
+                        fig = go.Figure(go.Bar(x=syms_w, y=vals_w, marker_color=colors_w))
+                        fig.update_layout(template="plotly_dark", height=270,
+                                          margin=dict(l=10, r=10, t=30, b=40))
+                        st.plotly_chart(fig, use_container_width=True)
+
+            if s.get("meta"):
+                st.caption(f"Méta: {s['meta']}")
 
 
-# ── TAB : Portfolio ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB : Portfolio
+# ─────────────────────────────────────────────────────────────────────────────
 with tab_pf:
-    st.markdown('<div class="section-header">💰 Performance — Paper Trading (no market impact)</div>',
+    st.markdown('<div class="section-header">💼 Portfolio — Paper Trading (no market impact)</div>',
                 unsafe_allow_html=True)
 
-    # ── Calculs PnL ──────────────────────────────────────────────────────────
-    upnl        = sum(p.get("upnl", 0) for p in snap["positions"].values())
-    pnl_net     = snap["realized_pnl"] + upnl - snap["total_fees"]
-    pnl_gross   = snap["realized_pnl"] + upnl
-    total_notional = sum(p.get("notional", 0) for p in snap["positions"].values())
-    init        = snap["initial_equity"]
-
-    # ── Ligne 1 : métriques principales ──────────────────────────────────────
-    r1 = st.columns(6)
-    r1[0].metric("PnL net ($)",      f"${pnl_net:+,.2f}",
-                 help="Réalisé + Unrealized − Frais")
-    r1[1].metric("PnL brut ($)",     f"${pnl_gross:+,.2f}",
-                 help="Réalisé + Unrealized (avant frais)")
-    r1[2].metric("Frais cumulés",    f"${snap['total_fees']:.2f}",
-                 help="3.5 bps par trade, taker Hyperliquid")
-    r1[3].metric("Retour net (%)",   _pct(pnl_net / init * 100) if init > 0 else "—")
-    r1[4].metric("uPnL ouvert",      f"${upnl:+,.2f}")
-    r1[5].metric("Notional total",   f"${total_notional:,.0f}",
-                 help="Somme |qty × mark| toutes positions")
-
-    # ── Ligne 2 : métriques risque / perf ────────────────────────────────────
-    metrics = _compute_metrics(snap["equity_history"], init, snap)
-    r2 = st.columns(5)
-    if metrics:
-        r2[0].metric("Sharpe annualisé", _fmt(metrics["sharpe"]))
-        r2[1].metric("Max Drawdown",     _pct(metrics["max_dd_pct"]))
-        r2[2].metric("Win Rate",         _pct(metrics["win_rate"] * 100, 1))
-        r2[3].metric("Nb trades",        str(metrics["n_trades"]))
-    r2[4].metric("Barres traitées",  str(snap["n_bars"]))
-
-    st.divider()
-
-    # ── Graphique PnL live (net + brut + drawdown) ───────────────────────────
-    st.markdown("#### PnL live — net vs brut (avant frais)")
-    _plot_pnl_chart(snap["equity_history"], init, snap["total_fees"])
-
-    # ── Réalisé vs Unrealized ─────────────────────────────────────────────────
-    with st.expander("Détail PnL réalisé / unrealized / frais"):
-        dc = st.columns(3)
-        dc[0].metric("PnL réalisé",   f"${snap['realized_pnl']:+,.2f}")
-        dc[1].metric("uPnL (open)",   f"${upnl:+,.2f}")
-        dc[2].metric("Gains / Pertes", f"{snap['n_wins']} ✅ / {snap['n_losses']} ❌")
-
-
-# ── TAB : Positions ──────────────────────────────────────────────────────────
-with tab_pos:
-    st.markdown('<div class="section-header">📋 Positions courantes</div>',
-                unsafe_allow_html=True)
-
-    positions = snap["positions"]
-    if positions:
-        rows = []
-        for sym, p in sorted(positions.items(),
-                             key=lambda x: abs(x[1].get("upnl", 0)), reverse=True):
-            qty  = p.get("qty", 0)
-            upnl = p.get("upnl", 0)
-            rows.append({
-                "Coin"     : sym,
-                "Side"     : "🟢 LONG" if qty > 0 else "🔴 SHORT",
-                "Qté"      : f"{qty:.6f}",
-                "Entry"    : f"${p.get('entry_px', 0):,.4f}",
-                "Mark"     : f"${p.get('current_px', 0):,.4f}",
-                "Notional" : f"${p.get('notional', 0):,.1f}",
-                "uPnL"     : f"${upnl:+,.2f}",
-                "Z-Score"  : f"{p.get('zscore', 0):+.3f}",
-                "Poids"    : f"{p.get('weight', 0):+.4f}",
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        total_upnl   = sum(p.get("upnl", 0)      for p in positions.values())
-        total_notional = sum(p.get("notional", 0) for p in positions.values())
-        pc = st.columns(3)
-        pc[0].metric("uPnL total",     f"${total_upnl:+,.2f}")
-        pc[1].metric("Notional total", f"${total_notional:,.0f}")
-        pc[2].metric("Nb positions",   str(len(positions)))
+    enabled_strat_names = [name for name, s in snap["strategies"].items() if s["enabled"]]
+    if not enabled_strat_names:
+        st.info("Aucune stratégie active.")
     else:
-        st.info(
-            "Aucune position ouverte.\n\n"
-            "Les positions s'ouvrent quand un z-score dépasse **z_in = 1.5** "
-            "après le warmup."
-        )
+        # Sub-tabs: one per strategy + Aggregate
+        subtab_names  = enabled_strat_names + ["📊 Agrégé"]
+        subtabs = st.tabs(subtab_names)
+
+        # ── Per-strategy sub-tabs ─────────────────────────────────────────────
+        for i, strat_name in enumerate(enabled_strat_names):
+            s    = snap["strategies"][strat_name]
+            init = snap["initial_equity"]
+            color = STRATEGY_COLORS.get(strat_name, "#2ecc71")
+
+            with subtabs[i]:
+                # Status + bar counter
+                st.markdown(
+                    f'{_badge(s["status"])} &nbsp; '
+                    f'**{strat_name}** — {s["n_bars"]} barres | '
+                    f'Warmup: {s["bars_seen"]}/{s["warmup_bars"]}',
+                    unsafe_allow_html=True
+                )
+
+                # ── Métriques principales ──────────────────────────────────────
+                upnl = sum(p.get("upnl", 0) for p in s["positions"].values())
+                pnl_net   = s["realized_pnl"] + upnl - s["total_fees"]
+                pnl_gross = s["realized_pnl"] + upnl
+                total_notional = sum(p.get("notional", 0) for p in s["positions"].values())
+
+                r1 = st.columns(6)
+                r1[0].metric("PnL net ($)",   f"${pnl_net:+,.2f}", help="Réalisé+uPnL−Frais")
+                r1[1].metric("PnL brut ($)",  f"${pnl_gross:+,.2f}")
+                r1[2].metric("Frais cumulés", f"${s['total_fees']:.2f}", help="3.5 bps taker")
+                r1[3].metric("Retour net",    _pct(pnl_net / init * 100) if init > 0 else "—")
+                r1[4].metric("uPnL ouvert",   f"${upnl:+,.2f}")
+                r1[5].metric("Notional",      f"${total_notional:,.0f}")
+
+                # ── Métriques risque ──────────────────────────────────────────
+                metrics = _compute_metrics(
+                    s["equity_history"], init, tf_s, s["n_wins"], s["n_losses"]
+                )
+                r2 = st.columns(5)
+                if metrics:
+                    r2[0].metric("Sharpe",    _fmt(metrics["sharpe"]))
+                    r2[1].metric("MaxDD",     _pct(metrics["max_dd_pct"]))
+                    r2[2].metric("Win Rate",  _pct(metrics["win_rate"] * 100, 1))
+                    r2[3].metric("Trades",    str(metrics["n_trades"]))
+                r2[4].metric("Barres",        str(s["n_bars"]))
+
+                # ── Turnover + fees average ───────────────────────────────────
+                if s["turnover_history"]:
+                    avg_to  = float(np.mean([v for _, v in s["turnover_history"]]))
+                    avg_fee = float(np.mean([v for _, v in s["fee_history"]])) if s["fee_history"] else 0.0
+                    cum_to  = float(sum(v for _, v in s["turnover_history"]))
+                    tc1, tc2, tc3 = st.columns(3)
+                    tc1.metric("Turnover moyen/barre", f"{avg_to:.4f}")
+                    tc2.metric("Frais moyen/barre",    f"${avg_fee:.4f}")
+                    tc3.metric("Turnover cumulé",       f"{cum_to:.2f}")
+
+                st.divider()
+
+                # ── PnL chart ─────────────────────────────────────────────────
+                st.markdown("#### Courbe PnL live")
+                _plot_pnl_chart(s["equity_history"], init, s["total_fees"],
+                                color=color, label=strat_name)
+
+                # ── Turnover chart ────────────────────────────────────────────
+                if s["turnover_history"]:
+                    with st.expander("📊 Turnover & Frais par barre"):
+                        _plot_turnover_chart(s["turnover_history"], s["fee_history"], color=color)
+
+                # ── Positions ─────────────────────────────────────────────────
+                positions = s["positions"]
+                if positions:
+                    with st.expander(f"📋 Positions ouvertes ({len(positions)})"):
+                        rows = []
+                        for sym, p in sorted(positions.items(),
+                                             key=lambda x: abs(x[1].get("upnl", 0)), reverse=True):
+                            qty = p.get("qty", 0)
+                            rows.append({
+                                "Coin"    : sym,
+                                "Side"    : "🟢 LONG" if qty > 0 else "🔴 SHORT",
+                                "Qté"     : f"{qty:.6f}",
+                                "Entry"   : f"${p.get('entry_px', 0):,.4f}",
+                                "Mark"    : f"${p.get('current_px', 0):,.4f}",
+                                "Notional": f"${p.get('notional', 0):,.1f}",
+                                "uPnL"    : f"${p.get('upnl', 0):+,.2f}",
+                                "Z-Score" : f"{p.get('zscore', 0):+.3f}",
+                            })
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # ── Aggregate sub-tab ─────────────────────────────────────────────────
+        with subtabs[-1]:
+            st.markdown("#### Vue agrégée — toutes stratégies actives")
+
+            if not enabled_strat_names:
+                st.info("Aucune stratégie active.")
+            else:
+                # Combine equity histories (align by timestamp)
+                total_eq_by_ts: Dict[str, float] = {}
+                total_init = 0.0
+
+                for strat_name in enabled_strat_names:
+                    s    = snap["strategies"][strat_name]
+                    init = snap["initial_equity"]
+                    total_init += init
+                    for ts_iso, eq in s["equity_history"]:
+                        total_eq_by_ts[ts_iso] = total_eq_by_ts.get(ts_iso, 0.0) + eq
+
+                if total_eq_by_ts:
+                    agg_hist = sorted(total_eq_by_ts.items())
+
+                    # Aggregate metrics
+                    total_pnl_net = sum(
+                        s["realized_pnl"]
+                        + sum(p.get("upnl", 0) for p in s["positions"].values())
+                        - s["total_fees"]
+                        for s in [snap["strategies"][n] for n in enabled_strat_names]
+                    )
+                    total_fees = sum(snap["strategies"][n]["total_fees"] for n in enabled_strat_names)
+                    total_trades = sum(snap["strategies"][n]["n_wins"] + snap["strategies"][n]["n_losses"]
+                                       for n in enabled_strat_names)
+
+                    ag1, ag2, ag3, ag4 = st.columns(4)
+                    ag1.metric("PnL net agrégé ($)",  f"${total_pnl_net:+,.2f}")
+                    ag2.metric("Frais totaux ($)",     f"${total_fees:.2f}")
+                    ag3.metric("Retour net (%)",        _pct(total_pnl_net / total_init * 100) if total_init > 0 else "—")
+                    ag4.metric("Trades totaux",         str(total_trades))
+
+                    # Multi-curve chart
+                    if go:
+                        fig = go.Figure()
+                        for strat_name in enabled_strat_names:
+                            s = snap["strategies"][strat_name]
+                            if s["equity_history"]:
+                                ts_p = [datetime.fromisoformat(t) for t, _ in s["equity_history"]]
+                                pnl_ = [e - snap["initial_equity"] for _, e in s["equity_history"]]
+                                fig.add_trace(go.Scatter(
+                                    x=ts_p, y=pnl_,
+                                    name=strat_name,
+                                    line=dict(color=STRATEGY_COLORS.get(strat_name, "#fff"), width=2),
+                                ))
+                        if agg_hist:
+                            ts_agg = [datetime.fromisoformat(t) for t, _ in agg_hist]
+                            pnl_agg = [e - total_init for _, e in agg_hist]
+                            fig.add_trace(go.Scatter(
+                                x=ts_agg, y=pnl_agg,
+                                name="Agrégé",
+                                line=dict(color="#fff", width=3, dash="dash"),
+                            ))
+                        fig.update_layout(
+                            template="plotly_dark", height=380,
+                            margin=dict(l=10, r=10, t=40, b=10),
+                            legend=dict(orientation="h"),
+                            yaxis=dict(tickprefix="$"),
+                            title="PnL net par stratégie + agrégé",
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AUTO-REFRESH (st.rerun = delta WebSocket, sans rechargement navigateur)
+# TAB : Config
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_cfg:
+    st.markdown('<div class="section-header">⚙️ Configuration courante</div>', unsafe_allow_html=True)
+
+    config = snap.get("config", {})
+    if config:
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            st.markdown("**Paramètres globaux**")
+            st.json({
+                "network"       : config.get("network"),
+                "timeframe"     : tf_label_disp,
+                "tf_seconds"    : config.get("tf_seconds"),
+                "initial_equity": config.get("initial_equity"),
+                "gross_leverage": config.get("gross_leverage"),
+                "n_coins"       : len(config.get("selected", [])),
+                "coins"         : config.get("selected", []),
+            })
+        with col_c2:
+            st.markdown("**Stratégies configurées**")
+            strat_cfg = {
+                name: ("🟢 ON" if v else "⚫ OFF")
+                for name, v in config.get("enabled_strategies", {}).items()
+            }
+            st.json(strat_cfg)
+
+        st.markdown("**Paramètres cost-aware filter**")
+        st.json({
+            "fee_bps"           : FEE_BPS,
+            "slip_bps"          : SLIP_BPS,
+            "round_trip_bps"    : ROUND_TRIP_BPS,
+            "buffer_bps"        : BUFFER_BPS,
+            "threshold_bps"     : THRESHOLD_BPS,
+            "delta_w_min"       : DELTA_W_MIN,
+            "min_trade_notional": MIN_TRADE_NOTIONAL,
+        })
+    else:
+        st.info("Démarrez une session pour voir la configuration.")
+
+    if is_running:
+        st.warning("⟳ Pour appliquer une nouvelle config, cliquez **Reload Config** dans le sidebar.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-REFRESH
 # ─────────────────────────────────────────────────────────────────────────────
 
-if auto_refresh and snap["status"] != "idle":
+if auto_refresh and snap["global_status"] != "idle":
     time.sleep(int(refresh_s))
     st.rerun()

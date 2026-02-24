@@ -86,3 +86,27 @@ class HyperliquidMarketData:
     async def stream_trades(self, coin: str, cb: WSCallback) -> str:
         sub: Json = {"type": "trades", "coin": coin}
         return await self.ws_subscribe(sub, cb)
+
+    async def stream_trades_multi(self, coins: list, cb: WSCallback) -> list:
+        """Subscribe to trades feed for multiple coins. Returns list of subscription keys."""
+        keys = []
+        for coin in coins:
+            try:
+                key = await self.stream_trades(coin, cb)
+                keys.append(key)
+            except Exception:
+                pass
+        return keys
+
+    async def stream_l2_books_multi(self, coins: list, cb: WSCallback,
+                                    n_sig_figs: int = 5, n_levels: int = 20) -> list:
+        """Subscribe to l2Book feed for multiple coins. Returns list of subscription keys."""
+        keys = []
+        for coin in coins:
+            try:
+                key = await self.stream_l2_book(coin, n_sig_figs=n_sig_figs,
+                                                n_levels=n_levels, cb=cb)
+                keys.append(key)
+            except Exception:
+                pass
+        return keys

@@ -12,6 +12,15 @@ from .funding_divergence_signal import (
 )
 from .allocator import AllocatorConfig, PortfolioAllocator
 
+# Signal Agents (multi-strategy)
+from .base_signal_agent import BaseSignalAgent, AgentContext, AgentOutput
+from .momentum import CrossSectionalMomentumAgent, MomentumConfig
+from .funding_carry_pure import FundingCarryPureAgent, FundingCarryConfig
+from .liquidation_reversion import LiquidationReversionAgent, LiquidationReversionConfig
+from .ob_imbalance import OrderFlowImbalanceAgent, OBImbalanceConfig
+from .pca_residual_mr import PCAResiduaMRAgent, PCAResiduaMRConfig
+from .quality_liquidity import QualityLiquidityAgent, QualityLiquidityConfig
+
 __all__ = [
     "StatArbConfig",
     "StatArbState",
@@ -26,4 +35,20 @@ __all__ = [
     "FDSDiagnostics",
     "AllocatorConfig",
     "PortfolioAllocator",
+    # Signal Agents
+    "BaseSignalAgent",
+    "AgentContext",
+    "AgentOutput",
+    "CrossSectionalMomentumAgent",
+    "MomentumConfig",
+    "FundingCarryPureAgent",
+    "FundingCarryConfig",
+    "LiquidationReversionAgent",
+    "LiquidationReversionConfig",
+    "OrderFlowImbalanceAgent",
+    "OBImbalanceConfig",
+    "PCAResiduaMRAgent",
+    "PCAResiduaMRConfig",
+    "QualityLiquidityAgent",
+    "QualityLiquidityConfig",
 ]
