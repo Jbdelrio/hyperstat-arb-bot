@@ -1,7 +1,7 @@
 # apps/dashboard.py
 """
-Dashboard Streamlit HyperStat v2 — Monitoring temps réel.
-
+Dashboard HyperStat v2 — Monitoring temps réel (Dash + thème sombre CYBORG)
+===========================================================================
 Sections (navigation sidebar) :
     📡 System Status   — Exchange, agents ON/OFF/HALT, stratégies
     🤖 Agents IA       — Score de chaque agent en temps réel
@@ -9,11 +9,11 @@ Sections (navigation sidebar) :
     ⚠️  Risque          — VaR/CVaR, drawdown, corrélation, variance portfolio
     🌊 Régime          — Régime détecté, Q_t, Fear & Greed
     🔮 Prédictions ML  — Probabilités directionnelles par coin
-    📊 Equity Curves   — Courbe v1 baseline vs v2 multi-agents
-    🔢 Raw Tables      — Tables brutes (optionnel)
+    📊 Equity Curves   — Courbe equity normalisée
+    🔢 Raw Tables      — Tables brutes
 
 Lancement :
-    streamlit run apps/dashboard.py
+    python apps/dashboard.py
 """
 from __future__ import annotations
 
@@ -25,13 +25,17 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 
-# Plotly est optionnel mais recommandé
+import dash
+from dash import dcc, html, Input, Output, no_update
+import dash_bootstrap_components as dbc
+
 try:
     import plotly.graph_objects as go
+    _PLOTLY = True
 except Exception:
     go = None
+    _PLOTLY = False
 
 from hyperstat.monitoring.risk_metrics import (
     load_equity_df,
@@ -46,95 +50,37 @@ from hyperstat.monitoring.risk_metrics import (
 
 Json = Dict[str, Any]
 
+_DARK_BG  = "#0d0d1a"
+_CARD_BG  = "#111122"
+_PLOT_BG  = "#0f0f23"
+_SIDEBAR_W = "260px"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PAGE CONFIG
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-
-st.set_page_config(
-    page_title="HyperStat v2 — Live Dashboard",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# THEME & CSS
-# ─────────────────────────────────────────────────────────────────────────────
-
-st.markdown("""
-<style>
-    .stApp { background-color: #0e1117; color: #fafafa; }
-
-    .badge-active   { background:#1a7a3c; color:#fff; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-halted   { background:#8b1a1a; color:#fff; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-degraded { background:#8b6e1a; color:#fff; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-warming  { background:#2a3a6e; color:#fff; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-off      { background:#3a3a3a; color:#aaa; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
-
-    .section-header {
-        color: #7289da; font-size: 14px; font-weight: 600;
-        letter-spacing: 1.5px; text-transform: uppercase;
-        border-bottom: 1px solid #2a2d3a; padding-bottom: 6px; margin: 16px 0 12px 0;
-    }
-    .kill-switch-warning {
-        background: #4a1010; border: 2px solid #e74c3c; border-radius: 8px;
-        padding: 12px 16px; color: #ff6b6b; font-weight: 700; font-size: 16px; text-align: center;
-    }
-    .metric-positive { color: #2ecc71; }
-    .metric-negative { color: #e74c3c; }
-    .metric-neutral  { color: #95a5a6; }
-</style>
-""", unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITAIRES VISUELS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def status_badge(status: str) -> str:
-    css = {"active": "badge-active", "halted": "badge-halted",
-           "degraded": "badge-degraded", "warming_up": "badge-warming", "off": "badge-off"}
-    emoji = {"active": "🟢", "halted": "🔴", "degraded": "🟡", "warming_up": "🔵", "off": "⚫"}
-    cls = css.get(status, "badge-off")
-    ico = emoji.get(status, "⚫")
-    return f'<span class="{cls}">{ico} {status.upper().replace("_"," ")}</span>'
-
-
-def pnl_color(val: float) -> str:
-    if val > 0:  return f'<span class="metric-positive">+{val:.2f}$</span>'
-    if val < 0:  return f'<span class="metric-negative">{val:.2f}$</span>'
-    return f'<span class="metric-neutral">0.00$</span>'
-
-
-def score_bar(score: float, width: int = 120) -> str:
-    pct   = int((score + 1) / 2 * 100)
-    color = "#2ecc71" if score > 0.1 else "#e74c3c" if score < -0.1 else "#95a5a6"
-    return (f'<div style="background:#1a1d27;border-radius:4px;height:8px;width:{width}px;">'
-            f'<div style="background:{color};height:8px;border-radius:4px;width:{pct}%;"></div></div>'
-            f'<small style="color:#8892a4">{score:+.3f}</small>')
-
-
-def _human_pct(x: float, digits: int = 2) -> str:
-    if x is None or not np.isfinite(x): return "—"
-    return f"{100.0 * float(x):.{digits}f}%"
-
-
-def _human_num(x: float, digits: int = 2) -> str:
-    if x is None or not np.isfinite(x): return "—"
-    return f"{float(x):,.{digits}f}"
-
 
 def _safe_read_json(path: Path) -> Json:
-    if not path.exists(): return {}
+    if not path.exists():
+        return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
+def _human_pct(x, digits: int = 2) -> str:
+    if x is None or not np.isfinite(float(x)): return "—"
+    return f"{100.0 * float(x):.{digits}f}%"
+
+
+def _human_num(x, digits: int = 2) -> str:
+    if x is None or not np.isfinite(float(x)): return "—"
+    return f"{float(x):,.{digits}f}"
+
+
 def _pick_last_weights(weights_df: pd.DataFrame) -> Dict[str, float]:
-    if weights_df.empty or "ts" not in weights_df.columns: return {}
+    if weights_df.empty or "ts" not in weights_df.columns:
+        return {}
     ts_last = weights_df["ts"].max()
     w = weights_df[weights_df["ts"] == ts_last]
     out: Dict[str, float] = {}
@@ -146,45 +92,7 @@ def _pick_last_weights(weights_df: pd.DataFrame) -> Dict[str, float]:
     return out
 
 
-def _plot_line(x, y, name: str, height: int = 340):
-    if go is None:
-        st.line_chart(pd.DataFrame({name: y}, index=x))
-        return
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=name))
-    fig.update_layout(template="plotly_dark", height=height, margin=dict(l=10, r=10, t=35, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def _plot_area(x, y, name: str, height: int = 260):
-    if go is None:
-        st.area_chart(pd.DataFrame({name: y}, index=x))
-        return
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", fill="tozeroy", name=name))
-    fig.update_layout(template="plotly_dark", height=height, margin=dict(l=10, r=10, t=35, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def _plot_heatmap(mat: pd.DataFrame, title: str, height: int = 520):
-    if mat.empty:
-        st.info("Pas assez de données pour afficher la matrice.")
-        return
-    if go is None:
-        st.dataframe(mat, use_container_width=True)
-        return
-    fig = go.Figure(data=go.Heatmap(z=mat.values, x=mat.columns, y=mat.index))
-    fig.update_layout(template="plotly_dark", height=height,
-                      margin=dict(l=10, r=10, t=35, b=10), title=title)
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DONNÉES AGENTS (state.json) — avec demo fallback
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _demo_state() -> Json:
-    """Données de démonstration si aucun live runner n'est actif."""
     return {
         "exchange": {
             "connected": True, "mode": "paper",
@@ -202,7 +110,9 @@ def _demo_state() -> Json:
                                 "fg_raw": 52, "fg_label": "Neutral"},
             "PredictionAgent": {"status": "active",  "score": 0.51, "confidence": 0.71, "ic_recent": 0.055},
             "RegimeAgent"    : {"status": "active",  "score": 0.60, "confidence": 0.90, "ic_recent": 0.038,
-                                "current_regime": "mean_reverting", "current_qt": 1.0, "fg_signal": "neutral"},
+                                "current_regime": "mean_reverting", "current_qt": 1.0,
+                                "fg_signal": "neutral", "vol_score": 0.2,
+                                "momentum_score": 0.4, "liq_score": 0.1, "funding_score": 0.3},
         },
         "strategies": {
             "stat_arb_bucket_A": {"status": "active", "pnl": 124.5,  "n_positions": 4, "gross_exposure": 0.82},
@@ -217,8 +127,7 @@ def _demo_state() -> Json:
     }
 
 
-@st.cache_data(ttl=5)
-def load_state(run_dir: str) -> Json:
+def _load_state(run_dir: str) -> Json:
     p = Path(run_dir) / "state.json"
     if p.exists():
         data = _safe_read_json(p)
@@ -227,451 +136,700 @@ def load_state(run_dir: str) -> Json:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
+# PLOTLY FIGURE BUILDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-with st.sidebar:
-    st.markdown("### ⚙️ HyperStat v2")
-    st.divider()
-
-    st.subheader("Source")
-    run_dir = st.text_input("Run dir", value="artifacts/live/default")
-    run_path = Path(run_dir)
-
-    st.subheader("Refresh")
-    auto_refresh = st.toggle("Auto-refresh", value=True)
-    refresh_s = st.number_input("Intervalle (sec)", min_value=5, max_value=120, value=10, step=5,
-                                disabled=not auto_refresh)
-
-    st.subheader("Performance window")
-    eq_tail    = st.number_input("Equity rows (tail)",  min_value=1000,  max_value=250000,  value=50000,  step=5000)
-    mids_tail  = st.number_input("Mids rows (tail)",    min_value=5000,  max_value=1000000, value=200000, step=50000)
-    corr_window= st.number_input("Corr window bars",    min_value=200,   max_value=50000,   value=2000,   step=200)
-
-    st.subheader("VaR settings")
-    var_window    = st.number_input("VaR window (steps)",  min_value=500,  max_value=200000, value=5000, step=500)
-    horizon_steps = st.number_input("VaR horizon (steps)", min_value=1,    max_value=200,    value=1,    step=1)
-
-    st.divider()
-    st.subheader("Navigation")
-    section = st.radio("", [
-        "📡 System Status",
-        "🤖 Agents IA",
-        "📈 Portfolio",
-        "⚠️ Risque",
-        "🌊 Régime",
-        "🔮 Prédictions ML",
-        "📊 Equity Curves",
-        "🔢 Raw Tables",
-    ], label_visibility="collapsed")
-
-    st.divider()
-    show_raw = st.checkbox("Show raw tables", value=False)
-    if st.button("🔴 FLAT ALL (Emergency)", type="primary"):
-        st.error("⚠️ Flatten d'urgence — non implémenté en démo")
-
-    st.markdown(f"<small style='color:#8892a4'>UTC: {datetime.now(timezone.utc).strftime('%H:%M:%S')}</small>",
-                unsafe_allow_html=True)
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CHARGEMENT DES DONNÉES
-# ─────────────────────────────────────────────────────────────────────────────
-
-state      = load_state(run_dir)
-equity_df  = load_equity_df(str(run_path), tail=int(eq_tail))
-mids_df    = load_mids_df(str(run_path), tail=int(mids_tail))
-weights_df = load_weights_df(str(run_path), tail=int(mids_tail))
-snap       = _safe_read_json(run_path / "snapshot_latest.json")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HEADER GLOBAL
-# ─────────────────────────────────────────────────────────────────────────────
-
-col_title, col_exchange, col_mode, col_ts = st.columns([3, 2, 2, 2])
-
-with col_title:
-    st.markdown("## 📊 HyperStat v2 — Live Dashboard")
-
-exch = state.get("exchange", {})
-with col_exchange:
-    conn = exch.get("connected", False)
-    st.markdown(f"**Exchange** &nbsp; {status_badge('active' if conn else 'halted')}",
-                unsafe_allow_html=True)
-    if conn:
-        st.caption(f"Latence: {exch.get('latency_ms','?')}ms | Rate limit: {exch.get('rate_limit_pct','?')}%")
-
-with col_mode:
-    mode = exch.get("mode", "unknown").upper()
-    color = "#f39c12" if mode == "PAPER" else "#2ecc71" if mode == "LIVE" else "#95a5a6"
-    st.markdown(f"**Mode** &nbsp; <span style='color:{color};font-weight:700'>{mode}</span>",
-                unsafe_allow_html=True)
-
-with col_ts:
-    latest_ts = snap.get("ts") if isinstance(snap, dict) else None
-    st.markdown(f"**Snapshot** &nbsp; `{str(latest_ts)[:19] if latest_ts else '—'}`")
-
-# Kill-switch warning global
-sup = state.get("supervisor", {})
-if sup.get("kill_switch"):
-    st.markdown(
-        '<div class="kill-switch-warning">🚨 KILL-SWITCH ACTIVÉ — Toutes positions fermées</div>',
-        unsafe_allow_html=True
+def _empty_fig(height=340, msg="Données non disponibles"):
+    if not _PLOTLY:
+        return {}
+    return go.Figure().update_layout(
+        template="plotly_dark", height=height,
+        paper_bgcolor=_DARK_BG, plot_bgcolor=_PLOT_BG,
+        annotations=[{"text": msg, "xref": "paper", "yref": "paper",
+                      "x": 0.5, "y": 0.5, "showarrow": False,
+                      "font": {"color": "#666", "size": 13}}],
+        margin=dict(l=10, r=10, t=30, b=10),
     )
 
-st.divider()
+
+def _fig_line(x, y, name: str, height: int = 340, color: str = "#2ecc71"):
+    if not _PLOTLY:
+        return _empty_fig(height)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=name,
+                             line=dict(color=color, width=2)))
+    fig.update_layout(
+        template="plotly_dark", height=height,
+        margin=dict(l=10, r=10, t=35, b=10),
+        paper_bgcolor=_DARK_BG, plot_bgcolor=_PLOT_BG,
+    )
+    return fig
+
+
+def _fig_area(x, y, name: str, height: int = 260, color: str = "#e74c3c"):
+    if not _PLOTLY:
+        return _empty_fig(height)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", fill="tozeroy", name=name,
+                             line=dict(color=color, width=1.5),
+                             fillcolor="rgba(231,76,60,0.15)"))
+    fig.update_layout(
+        template="plotly_dark", height=height,
+        margin=dict(l=10, r=10, t=35, b=10),
+        paper_bgcolor=_DARK_BG, plot_bgcolor=_PLOT_BG,
+    )
+    return fig
+
+
+def _fig_heatmap(mat: pd.DataFrame, title: str, height: int = 520):
+    if not _PLOTLY or mat.empty:
+        return _empty_fig(height, "Pas assez de données")
+    fig = go.Figure(data=go.Heatmap(
+        z=mat.values, x=mat.columns, y=mat.index,
+        colorscale="RdYlGn", zmid=0,
+    ))
+    fig.update_layout(
+        template="plotly_dark", height=height,
+        margin=dict(l=10, r=10, t=45, b=10),
+        title=title,
+        paper_bgcolor=_DARK_BG, plot_bgcolor=_PLOT_BG,
+    )
+    return fig
+
+
+def _fig_score_bar(score: float, width: int = 140):
+    pct   = int((score + 1) / 2 * 100)
+    color = "#2ecc71" if score > 0.1 else "#e74c3c" if score < -0.1 else "#95a5a6"
+    return html.Div([
+        html.Div(style={
+            "background": "#1a1d27", "borderRadius": "4px",
+            "height": "8px", "width": f"{width}px",
+        }, children=[
+            html.Div(style={
+                "background": color, "height": "8px",
+                "borderRadius": "4px", "width": f"{pct}%",
+            }),
+        ]),
+        html.Small(f"{score:+.3f}", style={"color": "#8892a4", "fontSize": "11px"}),
+    ])
+
+
+def _status_badge(status: str):
+    _map = {
+        "active"    : ("#1a7a3c", "🟢 ACTIVE"),
+        "halted"    : ("#7a1a1a", "🔴 HALTED"),
+        "degraded"  : ("#7a5a0a", "🟡 DEGRADED"),
+        "warming_up": ("#2a3a6e", "🔵 WARMING UP"),
+        "off"       : ("#2a2a2a", "⚫ OFF"),
+    }
+    bg, label = _map.get(status, ("#2a2a2a", status.upper()))
+    return html.Span(label, style={
+        "background": bg, "color": "#fff",
+        "padding": "2px 8px", "borderRadius": "10px",
+        "fontSize": "10px", "fontWeight": "700",
+    })
+
+
+def _kpi(label: str, value: str, color: str = "#ddd") -> dbc.Col:
+    return dbc.Col(dbc.Card(dbc.CardBody([
+        html.Div(label, style={"fontSize": "10px", "color": "#666"}),
+        html.Div(value, style={"fontSize": "14px", "fontWeight": "700", "color": color}),
+    ], className="p-2"), style={"background": _CARD_BG, "border": "1px solid #2a2d3a"}))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION : SYSTEM STATUS
+# DASH APP
 # ─────────────────────────────────────────────────────────────────────────────
 
-if "System Status" in section:
-    st.markdown('<div class="section-header">📡 System Status — Exchange & Stratégies</div>',
-                unsafe_allow_html=True)
+app = dash.Dash(
+    __name__,
+    external_stylesheets=[dbc.themes.CYBORG],
+    suppress_callback_exceptions=True,
+    title="HyperStat v2 — Monitoring",
+)
 
-    # Exchange + Supervisor
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        eq_latest = float(snap.get("equity", np.nan)) if isinstance(snap, dict) and snap.get("equity") is not None else np.nan
-        st.metric("Run dir", run_dir)
-    with c2:
-        st.metric("Equity (latest)", _human_num(eq_latest))
-    with c3:
-        st.metric("Scale Factor", f"{sup.get('scale_factor', 0):.0%}")
-    with c4:
-        st.metric("Composite Score", f"{sup.get('composite_score', 0):+.3f}")
+_SIDEBAR_STYLE = {
+    "position": "fixed", "top": 0, "left": 0, "bottom": 0,
+    "width": _SIDEBAR_W, "overflowY": "auto", "padding": "15px",
+    "backgroundColor": "#0a0a14",
+    "borderRight": "1px solid #1e1e30",
+    "zIndex": 1000,
+}
+_CONTENT_STYLE = {
+    "marginLeft": f"calc({_SIDEBAR_W} + 10px)",
+    "padding": "18px 22px",
+    "minHeight": "100vh",
+    "backgroundColor": _DARK_BG,
+}
 
-    st.caption(f"🧠 {sup.get('reason', '')}")
-    st.divider()
+_SECTIONS = [
+    "📡 System Status",
+    "🤖 Agents IA",
+    "📈 Portfolio",
+    "⚠️ Risque",
+    "🌊 Régime",
+    "🔮 Prédictions ML",
+    "📊 Equity Curves",
+    "🔢 Raw Tables",
+]
 
-    # Stratégies
-    st.markdown("#### Stratégies")
-    strats = state.get("strategies", {})
-    for strat_name, info in strats.items():
-        status = info.get("status", "off")
-        c1, c2, c3, c4, c5 = st.columns([3, 2, 2, 2, 3])
-        with c1:
-            st.markdown(f"**{strat_name}** &nbsp; {status_badge(status)}", unsafe_allow_html=True)
-        with c2:
-            st.markdown(f"PnL: {pnl_color(info.get('pnl', 0.0))}", unsafe_allow_html=True)
-        with c3:
-            st.metric("Positions", info.get("n_positions", 0), label_visibility="collapsed")
-        with c4:
-            if status == "active":
-                st.metric("Gross Exp", f"{info.get('gross_exposure', 0):.0%}", label_visibility="collapsed")
-        with c5:
-            if status == "halted": st.caption(f"🔴 {info.get('halt_reason', '')}")
-            elif status == "off":  st.caption(f"⚫ {info.get('off_reason', '')}")
+app.layout = html.Div([
+    dcc.Interval(id="interval", interval=10_000, n_intervals=0),
+
+    # Sidebar
+    html.Div([
+        html.H5("📊 HyperStat v2", style={"color": "#7289da", "fontSize": "14px"}),
+        html.Hr(style={"borderColor": "#1e1e30"}),
+
+        html.Div("SOURCE", style={"color": "#555", "fontSize": "10px",
+                                   "letterSpacing": "1px", "marginBottom": "4px"}),
+        dbc.Input(id="input-run-dir", type="text",
+                  value="artifacts/live/default", size="sm",
+                  style={"backgroundColor": "#111", "color": "#ddd",
+                         "border": "1px solid #2a2d3a", "fontSize": "11px"},
+                  className="mb-2"),
+
+        html.Div("REFRESH", style={"color": "#555", "fontSize": "10px",
+                                    "letterSpacing": "1px", "marginBottom": "4px"}),
+        dbc.Row([
+            dbc.Col(dbc.Switch(id="toggle-refresh", value=True,
+                               label=html.Span("Auto", style={"fontSize": "11px"})), width=5),
+            dbc.Col(dbc.Input(id="input-refresh-s", type="number", value=10, min=5, max=120,
+                              size="sm",
+                              style={"backgroundColor": "#111", "color": "#ddd",
+                                     "border": "1px solid #2a2d3a"}), width=7),
+        ], className="mb-3 align-items-center g-1"),
+
+        html.Div("FENÊTRES", style={"color": "#555", "fontSize": "10px",
+                                     "letterSpacing": "1px", "marginBottom": "4px"}),
+        html.Div("Equity rows (tail)", style={"fontSize": "10px", "color": "#888"}),
+        dbc.Input(id="input-eq-tail", type="number", value=50000, min=1000, step=5000,
+                  size="sm", style={"backgroundColor": "#111", "color": "#ddd",
+                                     "border": "1px solid #2a2d3a"}, className="mb-1"),
+        html.Div("Corr window (bars)", style={"fontSize": "10px", "color": "#888"}),
+        dbc.Input(id="input-corr-window", type="number", value=2000, min=200, step=200,
+                  size="sm", style={"backgroundColor": "#111", "color": "#ddd",
+                                     "border": "1px solid #2a2d3a"}, className="mb-1"),
+        html.Div("VaR window (steps)", style={"fontSize": "10px", "color": "#888"}),
+        dbc.Input(id="input-var-window", type="number", value=5000, min=500, step=500,
+                  size="sm", style={"backgroundColor": "#111", "color": "#ddd",
+                                     "border": "1px solid #2a2d3a"}, className="mb-1"),
+        html.Div("VaR horizon (steps)", style={"fontSize": "10px", "color": "#888"}),
+        dbc.Input(id="input-var-horizon", type="number", value=1, min=1, max=200,
+                  size="sm", style={"backgroundColor": "#111", "color": "#ddd",
+                                     "border": "1px solid #2a2d3a"}, className="mb-3"),
+
+        html.Hr(style={"borderColor": "#1e1e30"}),
+        html.Div("NAVIGATION", style={"color": "#555", "fontSize": "10px",
+                                       "letterSpacing": "1px", "marginBottom": "4px"}),
+        dbc.RadioItems(
+            id="input-section",
+            options=[{"label": s, "value": s} for s in _SECTIONS],
+            value=_SECTIONS[0],
+            labelStyle={"display": "block", "fontSize": "11px",
+                         "padding": "3px 0", "cursor": "pointer"},
+            className="mb-3",
+        ),
+
+        html.Hr(style={"borderColor": "#1e1e30"}),
+        dbc.Checklist(
+            id="toggle-raw",
+            options=[{"label": html.Span("Afficher tables brutes",
+                                          style={"fontSize": "11px"}),
+                      "value": "show"}],
+            value=[], className="mb-2",
+        ),
+        dbc.Button("🚨 FLAT ALL (Emergency)", id="btn-flat-all",
+                   color="danger", size="sm", className="w-100", n_clicks=0),
+
+        html.Hr(style={"borderColor": "#1e1e30"}),
+        html.Small(id="sidebar-clock", style={"color": "#555", "fontSize": "10px"}),
+    ], style=_SIDEBAR_STYLE),
+
+    # Main content
+    html.Div([
+        # Header
+        dbc.Row([
+            dbc.Col(html.H4("📊 HyperStat v2 — Monitoring",
+                            style={"color": "#7289da", "fontSize": "17px", "margin": 0}), width=5),
+            dbc.Col(html.Div(id="header-exchange"), width=4),
+            dbc.Col(html.Div(id="header-snapshot"), width=3),
+        ], className="mb-2 align-items-center"),
+
+        html.Div(id="kill-switch-banner", className="mb-2"),
+        html.Hr(style={"borderColor": "#1e1e30"}),
+
+        # Main section content
+        html.Div(id="main-content"),
+
+        # Raw tables (always visible if toggled)
+        html.Div(id="raw-tables-section"),
+    ], style=_CONTENT_STYLE),
+], style={"backgroundColor": _DARK_BG, "minHeight": "100vh", "fontFamily": "monospace"})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION : AGENTS IA
+# CALLBACKS
 # ─────────────────────────────────────────────────────────────────────────────
 
-elif "Agents IA" in section:
-    st.markdown('<div class="section-header">🤖 Agents IA — Scores & Statuts</div>',
-                unsafe_allow_html=True)
-    agents = state.get("agents", {})
+@app.callback(
+    Output("interval", "disabled"),
+    Output("interval", "interval"),
+    Output("sidebar-clock", "children"),
+    Input("toggle-refresh", "value"),
+    Input("input-refresh-s", "value"),
+    Input("interval", "n_intervals"),
+)
+def update_interval(auto, refresh_s, _n):
+    ts = datetime.now(timezone.utc).strftime("UTC: %H:%M:%S")
+    return (not bool(auto), max(5, int(refresh_s or 10)) * 1000, ts)
 
-    agent_list = list(agents.items())
-    for i in range(0, len(agent_list), 2):
-        cols = st.columns(2)
-        for j, (ag_name, ag_info) in enumerate(agent_list[i:i+2]):
-            with cols[j]:
-                with st.container(border=True):
-                    status = ag_info.get("status", "off")
-                    st.markdown(f"**{ag_name}** &nbsp; {status_badge(status)}", unsafe_allow_html=True)
-                    score = ag_info.get("score", 0.0)
-                    conf  = ag_info.get("confidence", 0.0)
-                    ic    = ag_info.get("ic_recent", 0.0)
-                    st.markdown(f"Score: {score_bar(score)}", unsafe_allow_html=True)
-                    m1, m2, m3 = st.columns(3)
-                    with m1: st.metric("Confidence", f"{conf:.0%}")
-                    with m2: st.metric("IC récent",  f"{ic:.4f}")
-                    if ag_name == "SentimentAgent":
-                        with m3: st.metric("F&G", ag_info.get("fg_raw", "?"))
-                        st.caption(f"📰 {ag_info.get('fg_label', '?')}")
-                    elif ag_name == "RegimeAgent":
-                        with m3: st.metric("Q_t", f"{ag_info.get('current_qt', 0):.1f}")
-                        st.caption(f"🌊 Régime: **{ag_info.get('current_regime', 'unknown')}**")
 
-    st.divider()
-    rows = [{"Agent": k, "Statut": v.get("status","off").upper(),
+@app.callback(
+    Output("header-exchange",    "children"),
+    Output("header-snapshot",    "children"),
+    Output("kill-switch-banner", "children"),
+    Output("main-content",       "children"),
+    Output("raw-tables-section", "children"),
+    Input("interval",          "n_intervals"),
+    Input("input-section",     "value"),
+    Input("input-run-dir",     "value"),
+    Input("input-eq-tail",     "value"),
+    Input("input-corr-window", "value"),
+    Input("input-var-window",  "value"),
+    Input("input-var-horizon", "value"),
+    Input("toggle-raw",        "value"),
+)
+def update_dashboard(_n, section, run_dir, eq_tail, corr_window,
+                     var_window, var_horizon, show_raw):
+    run_dir     = run_dir or "artifacts/live/default"
+    eq_tail     = int(eq_tail or 50000)
+    corr_window = int(corr_window or 2000)
+    var_window  = int(var_window or 5000)
+    var_horizon = int(var_horizon or 1)
+    run_path    = Path(run_dir)
+
+    # Load data
+    state      = _load_state(run_dir)
+    equity_df  = load_equity_df(run_dir, tail=eq_tail)
+    mids_df    = load_mids_df(run_dir, tail=eq_tail * 4)
+    weights_df = load_weights_df(run_dir, tail=eq_tail * 4)
+    snap       = _safe_read_json(run_path / "snapshot_latest.json")
+
+    exch = state.get("exchange", {})
+    sup  = state.get("supervisor", {})
+
+    # ── Header Exchange ───────────────────────────────────────────────────────
+    conn  = exch.get("connected", False)
+    mode  = exch.get("mode", "unknown").upper()
+    mode_color = "#f39c12" if mode == "PAPER" else "#2ecc71" if mode == "LIVE" else "#95a5a6"
+    hdr_exch = dbc.Row([
+        dbc.Col([
+            _status_badge("active" if conn else "halted"),
+            html.Small(
+                f"  {exch.get('latency_ms', '?')}ms | {exch.get('rate_limit_pct', '?')}%",
+                style={"color": "#666", "fontSize": "10px"},
+            ),
+        ], width=7),
+        dbc.Col(
+            html.Span(mode, style={"color": mode_color, "fontWeight": "700", "fontSize": "13px"}),
+            width=5,
+        ),
+    ], className="align-items-center")
+
+    # ── Header Snapshot ───────────────────────────────────────────────────────
+    latest_ts = snap.get("ts") if isinstance(snap, dict) else None
+    hdr_snap  = html.Small(
+        f"Snapshot: {str(latest_ts)[:19] if latest_ts else '—'}",
+        style={"color": "#555", "fontSize": "10px"},
+    )
+
+    # ── Kill-switch banner ────────────────────────────────────────────────────
+    ks_banner = html.Div()
+    if sup.get("kill_switch"):
+        ks_banner = dbc.Alert(
+            "🚨 KILL-SWITCH ACTIVÉ — Toutes positions fermées",
+            color="danger", className="fw-bold text-center p-2",
+        )
+
+    # ── Emergency flat handler ─────────────────────────────────────────────── (no-op in demo)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SECTION : System Status
+    # ──────────────────────────────────────────────────────────────────────────
+    if "System Status" in (section or ""):
+        eq_latest = float(snap.get("equity", float("nan"))) if isinstance(snap, dict) and snap.get("equity") else float("nan")
+        strats    = state.get("strategies", {})
+
+        strat_rows = []
+        for sn, info in strats.items():
+            s = info.get("status", "off")
+            pnl = info.get("pnl", 0.0)
+            pnl_color = "#2ecc71" if pnl > 0 else "#e74c3c" if pnl < 0 else "#888"
+            strat_rows.append(html.Tr([
+                html.Td([_status_badge(s), html.Span(f"  {sn}", style={"fontSize": "12px", "marginLeft": "6px"})]),
+                html.Td(html.Span(f"{pnl:+.2f}$", style={"color": pnl_color, "fontSize": "12px"})),
+                html.Td(str(info.get("n_positions", 0)), style={"fontSize": "12px"}),
+                html.Td(f"{info.get('gross_exposure', 0):.0%}" if s == "active" else "—",
+                        style={"fontSize": "12px"}),
+                html.Td(html.Small(info.get("halt_reason", info.get("off_reason", "")),
+                                   style={"color": "#e74c3c" if s == "halted" else "#888",
+                                          "fontSize": "10px"})),
+            ]))
+
+        content = html.Div([
+            html.H6("📡 System Status", style={"color": "#7289da", "letterSpacing": "1px"}),
+            dbc.Row([
+                _kpi("Run dir",        run_dir, "#aaa"),
+                _kpi("Equity",         _human_num(eq_latest)),
+                _kpi("Scale Factor",   f"{sup.get('scale_factor', 0):.0%}"),
+                _kpi("Composite Score",f"{sup.get('composite_score', 0):+.3f}"),
+            ], className="mb-3 g-2"),
+            dbc.Alert(sup.get("reason", ""), color="dark",
+                      className="p-2", style={"fontSize": "11px"}),
+            html.H6("Stratégies", style={"color": "#aaa", "fontSize": "12px", "marginTop": "12px"}),
+            dbc.Table([
+                html.Thead(html.Tr([
+                    html.Th("Stratégie", style={"fontSize": "11px"}),
+                    html.Th("PnL",       style={"fontSize": "11px"}),
+                    html.Th("Positions", style={"fontSize": "11px"}),
+                    html.Th("Gross Exp", style={"fontSize": "11px"}),
+                    html.Th("Info",      style={"fontSize": "11px"}),
+                ])),
+                html.Tbody(strat_rows),
+            ], dark=True, hover=True, size="sm"),
+        ])
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SECTION : Agents IA
+    # ──────────────────────────────────────────────────────────────────────────
+    elif "Agents IA" in (section or ""):
+        agents = state.get("agents", {})
+        agent_cards = []
+        for ag_name, ag_info in agents.items():
+            st     = ag_info.get("status", "off")
+            score  = ag_info.get("score", 0.0)
+            conf   = ag_info.get("confidence", 0.0)
+            ic     = ag_info.get("ic_recent", 0.0)
+            extras = []
+            if ag_name == "SentimentAgent":
+                extras = [html.Small(
+                    f"F&G: {ag_info.get('fg_raw', '?')} — {ag_info.get('fg_label', '?')}",
+                    style={"color": "#f39c12"},
+                )]
+            elif ag_name == "RegimeAgent":
+                extras = [html.Small(
+                    f"Régime: {ag_info.get('current_regime', 'unknown')} | Q_t: {ag_info.get('current_qt', 0):.1f}",
+                    style={"color": "#3498db"},
+                )]
+            agent_cards.append(dbc.Col(
+                dbc.Card(dbc.CardBody([
+                    dbc.Row([
+                        dbc.Col(html.Strong(ag_name, style={"fontSize": "12px"}), width=7),
+                        dbc.Col(_status_badge(st), width=5),
+                    ], className="mb-2 align-items-center"),
+                    html.Div("Score:", style={"fontSize": "10px", "color": "#888", "marginBottom": "3px"}),
+                    _fig_score_bar(score),
+                    dbc.Row([
+                        dbc.Col(html.Div([
+                            html.Div("Confidence", style={"fontSize": "10px", "color": "#666"}),
+                            html.Div(f"{conf:.0%}", style={"fontSize": "13px", "fontWeight": "700"}),
+                        ]), width=6),
+                        dbc.Col(html.Div([
+                            html.Div("IC récent", style={"fontSize": "10px", "color": "#666"}),
+                            html.Div(f"{ic:.4f}", style={"fontSize": "13px", "fontWeight": "700"}),
+                        ]), width=6),
+                    ], className="mt-2"),
+                ] + extras), style={"background": _CARD_BG, "border": "1px solid #2a2d3a"}),
+                width=6, className="mb-2",
+            ))
+
+        rows_data = [
+            {"Agent": k, "Statut": v.get("status","off").upper(),
              "Score": f"{v.get('score',0):+.3f}",
              "Confidence": f"{v.get('confidence',0):.0%}",
              "IC récent": f"{v.get('ic_recent',0):.4f}"}
-            for k, v in agents.items()]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            for k, v in agents.items()
+        ]
+        content = html.Div([
+            html.H6("🤖 Agents IA", style={"color": "#7289da", "letterSpacing": "1px"}),
+            dbc.Row(agent_cards, className="mb-3"),
+            html.Hr(style={"borderColor": "#1e1e30"}),
+            dbc.Table.from_dataframe(pd.DataFrame(rows_data), dark=True, hover=True, size="sm"),
+        ])
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # SECTION : Portfolio
+    # ──────────────────────────────────────────────────────────────────────────
+    elif "Portfolio" in (section or ""):
+        metrics = compute_equity_metrics(equity_df, window=2000)
+        var95   = compute_var_cvar(equity_df, alpha=0.05, window=var_window, horizon_steps=var_horizon)
+        var99   = compute_var_cvar(equity_df, alpha=0.01, window=var_window, horizon_steps=var_horizon)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION : PORTFOLIO
-# ─────────────────────────────────────────────────────────────────────────────
-
-elif "Portfolio" in section:
-    st.markdown('<div class="section-header">📈 Portfolio — Equity & Positions</div>',
-                unsafe_allow_html=True)
-
-    # ── Top metrics depuis equity_df (données réelles) ──
-    metrics = compute_equity_metrics(equity_df, window=2000)
-    var95   = compute_var_cvar(equity_df, alpha=0.05, window=int(var_window), horizon_steps=int(horizon_steps))
-
-    mcols = st.columns(5)
-    mcols[0].metric("Ann. Return", _human_pct(metrics.get("ann_return", np.nan), 1))
-    mcols[1].metric("Ann. Vol",    _human_pct(metrics.get("ann_vol", np.nan), 1))
-    mcols[2].metric("Sharpe",      _human_num(metrics.get("sharpe", np.nan), 2))
-    mcols[3].metric("Max DD",      _human_pct(metrics.get("max_drawdown", np.nan), 1))
-    mcols[4].metric("VaR 95%",     _human_pct(var95.get("var_95", np.nan), 2))
-
-    st.divider()
-
-    # ── Equity curve ──
-    left, right = st.columns([2, 1])
-    with left:
-        st.subheader("Equity curve (PnL net)")
-        if equity_df.empty or "equity" not in equity_df.columns:
-            st.warning("Aucune donnée `equity.csv`. Lance le runner live/paper.")
-        else:
-            _plot_line(equity_df.index, equity_df["equity"].astype(float), "Equity", height=340)
-            opt_cols = [c for c in ["pnl_step", "fees_est", "slip_est"] if c in equity_df.columns]
-            if opt_cols:
-                st.caption("Breakdown PnL/fees/slippage")
-                small = equity_df[opt_cols].tail(500)
-                if go is None:
-                    st.line_chart(small)
-                else:
-                    fig = go.Figure()
-                    for c in opt_cols:
-                        fig.add_trace(go.Scatter(x=small.index, y=small[c], mode="lines", name=c))
-                    fig.update_layout(template="plotly_dark", height=240,
-                                      margin=dict(l=10, r=10, t=25, b=10))
-                    st.plotly_chart(fig, use_container_width=True)
-
-    with right:
-        st.subheader("Drawdown")
+        # Equity chart
         if not equity_df.empty and "equity" in equity_df.columns:
-            dd = compute_drawdown(equity_df["equity"])
-            _plot_area(dd.index, dd.values, "Drawdown", height=240)
-        st.subheader("VaR / CVaR")
-        var99 = compute_var_cvar(equity_df, alpha=0.01, window=int(var_window), horizon_steps=int(horizon_steps))
-        st.write(f"VaR 99%:  **{_human_pct(var99.get('var_99', np.nan), 2)}**")
-        st.write(f"CVaR 99%: **{_human_pct(var99.get('cvar_99', np.nan), 2)}**")
-        st.write(f"Horizon:  **{int(horizon_steps)} step(s)**")
+            eq_fig = _fig_line(equity_df.index, equity_df["equity"].astype(float), "Equity")
+            dd     = compute_drawdown(equity_df["equity"])
+            dd_fig = _fig_area(dd.index, dd.values, "Drawdown", height=240)
+        else:
+            eq_fig = _empty_fig(340, "Lancer le runner pour avoir les données equity.csv")
+            dd_fig = _empty_fig(240)
 
-    st.divider()
-
-    # ── Positions mark-to-market (depuis snapshot_latest.json) ──
-    st.subheader("Positions (mark-to-market)")
-    if not snap:
-        st.info("Pas de `snapshot_latest.json`. Le runner live doit écrire ce fichier.")
-    else:
-        mids      = snap.get("mids") or {}
+        # Positions table
+        mids_snap = snap.get("mids") or {}
         positions = snap.get("positions") or {}
         tgt       = snap.get("target_weights") or {}
-        eq_latest = float(snap.get("equity", np.nan)) if snap.get("equity") is not None else np.nan
-
-        rows = []
+        eq_lat    = float(snap.get("equity", float("nan"))) if snap.get("equity") is not None else float("nan")
+        pos_rows  = []
         for sym, p in positions.items():
             qty    = float(p.get("qty", 0.0))
             entry  = float(p.get("entry_px", 0.0))
-            mid    = float(mids.get(sym, np.nan)) if sym in mids else np.nan
-            notional = qty * mid if np.isfinite(mid) else np.nan
-            upnl     = (mid - entry) * qty if (np.isfinite(mid) and entry > 0.0) else np.nan
-            w_cur    = (notional / eq_latest) if (np.isfinite(notional) and np.isfinite(eq_latest) and abs(eq_latest) > 1e-12) else np.nan
-            w_tgt    = float(tgt.get(sym, 0.0)) if sym in tgt else 0.0
-            rows.append({"symbol": sym, "qty": qty, "entry_px": entry, "mid": mid,
-                         "notional": notional, "uPnL": upnl,
-                         "weight_cur": w_cur, "weight_target": w_tgt})
-
-        pos_df = pd.DataFrame(rows)
+            mid    = float(mids_snap.get(sym, float("nan"))) if sym in mids_snap else float("nan")
+            notional = qty * mid if np.isfinite(mid) else float("nan")
+            upnl     = (mid - entry) * qty if (np.isfinite(mid) and entry > 0) else float("nan")
+            w_cur    = (notional / eq_lat) if (np.isfinite(notional) and np.isfinite(eq_lat) and abs(eq_lat) > 1e-12) else float("nan")
+            w_tgt    = float(tgt.get(sym, 0.0))
+            pos_rows.append({"Symbol": sym, "Qty": qty, "Entry": entry, "Mid": mid,
+                              "Notional": notional, "uPnL": upnl,
+                              "W_cur": w_cur, "W_tgt": w_tgt})
+        pos_df = pd.DataFrame(pos_rows)
         if not pos_df.empty:
-            pos_df = pos_df.sort_values("notional", key=lambda s: s.abs(), ascending=False)
-            st.dataframe(pos_df, use_container_width=True)
-        else:
-            st.info("Snapshot présent, aucune position non-nulle.")
+            pos_df = pos_df.sort_values("Notional", key=lambda s: s.abs(), ascending=False)
 
+        content = html.Div([
+            html.H6("📈 Portfolio — Equity & Positions", style={"color": "#7289da", "letterSpacing": "1px"}),
+            dbc.Row([
+                _kpi("Ann. Return", _human_pct(metrics.get("ann_return"))),
+                _kpi("Ann. Vol",    _human_pct(metrics.get("ann_vol"))),
+                _kpi("Sharpe",      _human_num(metrics.get("sharpe"))),
+                _kpi("Max DD",      _human_pct(metrics.get("max_drawdown"))),
+                _kpi("VaR 95%",     _human_pct(var95.get("var_95"))),
+            ], className="mb-3 g-2"),
+            dbc.Row([
+                dbc.Col([
+                    html.H6("Equity curve (PnL net)",
+                            style={"fontSize": "12px", "color": "#aaa"}),
+                    dcc.Graph(figure=eq_fig, config={"displayModeBar": False}),
+                ], width=8),
+                dbc.Col([
+                    html.H6("Drawdown", style={"fontSize": "12px", "color": "#aaa"}),
+                    dcc.Graph(figure=dd_fig, config={"displayModeBar": False}),
+                    html.H6("VaR / CVaR", style={"fontSize": "12px", "color": "#aaa", "marginTop": "8px"}),
+                    dbc.Table([html.Tbody([
+                        html.Tr([html.Td("VaR 99%"),  html.Td(_human_pct(var99.get("var_99")))]),
+                        html.Tr([html.Td("CVaR 99%"), html.Td(_human_pct(var99.get("cvar_99")))]),
+                        html.Tr([html.Td("Horizon"),  html.Td(f"{var_horizon} step(s)")]),
+                    ])], dark=True, size="sm"),
+                ], width=4),
+            ], className="mb-3"),
+            html.H6("Positions (mark-to-market)", style={"fontSize": "12px", "color": "#aaa"}),
+            (dbc.Table.from_dataframe(pos_df, dark=True, hover=True, size="sm", striped=True)
+             if not pos_df.empty
+             else dbc.Alert("Pas de snapshot_latest.json ou aucune position.",
+                            color="secondary")),
+        ])
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION : RISQUE
-# ─────────────────────────────────────────────────────────────────────────────
-
-elif "Risque" in section:
-    st.markdown('<div class="section-header">⚠️ Risk Management</div>', unsafe_allow_html=True)
-
-    metrics = compute_equity_metrics(equity_df, window=2000)
-    var95   = compute_var_cvar(equity_df, alpha=0.05, window=int(var_window), horizon_steps=int(horizon_steps))
-    var99   = compute_var_cvar(equity_df, alpha=0.01, window=int(var_window), horizon_steps=int(horizon_steps))
-
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Ann. Return", _human_pct(metrics.get("ann_return", np.nan), 1))
-    c2.metric("Ann. Vol",    _human_pct(metrics.get("ann_vol", np.nan), 1))
-    c3.metric("Sharpe",      _human_num(metrics.get("sharpe", np.nan), 2))
-    c4.metric("Max DD",      _human_pct(metrics.get("max_drawdown", np.nan), 1))
-    c5.metric("VaR 95%",     _human_pct(var95.get("var_95", np.nan), 2))
-    c6.metric("CVaR 95%",    _human_pct(var95.get("cvar_95", np.nan), 2))
-
-    st.caption("VaR/CVaR = historique sur returns equity. Horizon: "
-               f"{int(horizon_steps)} step(s) | Fenêtre: {int(var_window)} steps.")
-
-    st.divider()
-
-    # Barre de progression drawdown vers kill-switch
-    st.markdown("#### Drawdown courant vs Kill-Switch")
-    if not equity_df.empty and "equity" in equity_df.columns:
-        eq_s = equity_df["equity"].dropna()
-        if len(eq_s) > 0:
-            peak    = eq_s.cummax()
-            dd_cur  = float(((eq_s - peak) / peak).iloc[-1] * 100)
-            max_dd  = float(metrics.get("max_drawdown", 0) * 100)
-            ks_thr  = 3.0  # seuil kill-switch (3%)
-            progress= min(1.0, abs(dd_cur) / ks_thr)
-            st.progress(progress, text=f"DD courant: {dd_cur:.2f}% | Max: {max_dd:.2f}% | Kill-switch à −{ks_thr:.0f}%")
-
-    st.divider()
-
-    # Corrélation
-    st.subheader("Correlation matrix (returns from mids)")
-    corr = compute_correlation_matrix(mids_df, window=int(corr_window))
-    _plot_heatmap(corr, title="Corr(returns)", height=500)
-
-    st.divider()
-
-    # Portfolio variance
-    st.subheader("Portfolio variance (weights × cov)")
-    w_last = _pick_last_weights(weights_df)
-    port   = compute_portfolio_var_from_weights(mids_df, weights_last=w_last, window=int(corr_window))
-    pc1, pc2, pc3 = st.columns(3)
-    pc1.metric("Port vol/step", _human_num(port.get("port_vol_step", np.nan), 6))
-    pc2.metric("Port var/step", _human_num(port.get("port_var_step", np.nan), 10))
-    pc3.metric("#assets used",  str(int(port.get("n_assets", 0))))
-    st.caption("Vol/step = volatilité sur un pas de temps (bar).")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION : RÉGIME
-# ─────────────────────────────────────────────────────────────────────────────
-
-elif "Régime" in section:
-    st.markdown('<div class="section-header">🌊 Régime de Marché</div>', unsafe_allow_html=True)
-
-    ag_regime = state.get("agents", {}).get("RegimeAgent", {})
-    ag_sent   = state.get("agents", {}).get("SentimentAgent", {})
-    regime    = ag_regime.get("current_regime", "unknown")
-    qt        = ag_regime.get("current_qt", 0.5)
-
-    regime_desc = {
-        "mean_reverting" : ("🟢 Mean Reverting",  "Conditions idéales pour stat-arb. Q_t = 1.0"),
-        "carry_favorable": ("🟢 Carry Favorable",  "Funding stable et élevé. Boost overlay carry."),
-        "trending"       : ("🟡 Trending",          "Momentum fort. Exposition réduite. Q_t = 0.3"),
-        "high_vol"       : ("🔴 High Vol",          "Vol BTC > p90. Stratégie stoppée. Q_t = 0.0"),
-        "crisis"         : ("🚨 CRISIS",            "Liquidations massives. Kill-switch activé."),
-        "unknown"        : ("⚪ Unknown",            "Données insuffisantes pour classifier."),
-    }
-    label, desc = regime_desc.get(regime, ("⚪ Unknown", ""))
-    st.markdown(f"## {label}")
-    st.info(desc)
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1: st.metric("Q_t appliqué", f"{qt:.1f}")
-    with c2: st.metric("Fear & Greed",  f"{ag_sent.get('fg_raw', 50)} / 100")
-    with c3: st.metric("Vol Score",     f"{ag_regime.get('vol_score', 0):.3f}")
-    with c4: st.metric("Momentum",      f"{ag_regime.get('momentum_score', 0):.3f}")
-
-    st.divider()
-    st.markdown("#### Composantes du score régime")
-    df_comp = pd.DataFrame({
-        "Composante"  : ["Volatilité", "Momentum", "Liquidations", "Funding"],
-        "Score"       : [ag_regime.get("vol_score", 0), ag_regime.get("momentum_score", 0),
-                         ag_regime.get("liq_score", 0), ag_regime.get("funding_score", 0)],
-        "Poids"       : [0.35, 0.40, 0.15, 0.10],
-    })
-    df_comp["Contribution"] = df_comp["Score"] * df_comp["Poids"]
-    st.dataframe(df_comp.round(4), use_container_width=True, hide_index=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION : PRÉDICTIONS ML
-# ─────────────────────────────────────────────────────────────────────────────
-
-elif "Prédictions" in section:
-    st.markdown('<div class="section-header">🔮 Prédictions ML — PredictionAgent</div>',
-                unsafe_allow_html=True)
-
-    probas = state.get("predictions", {})
-    if probas:
-        st.markdown("#### Probabilités directionnelles (horizon 1h)")
-        st.caption("P > 0.55 → haussier | P < 0.45 → baissier")
-        rows = []
-        for sym, p in sorted(probas.items(), key=lambda x: -x[1]):
-            direction = "🟢 BULLISH" if p > 0.55 else "🔴 BEARISH" if p < 0.45 else "⚪ NEUTRAL"
-            rows.append({"Symbole": sym, "P(hausse)": f"{p:.3f}",
-                         "Score": f"{2*(p-0.5):+.3f}", "Signal": direction})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    else:
-        st.info("Pas de prédictions disponibles dans state.json.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION : EQUITY CURVES (v1 vs v2)
-# ─────────────────────────────────────────────────────────────────────────────
-
-elif "Equity Curves" in section:
-    st.markdown('<div class="section-header">📊 Equity Curves — v1 Baseline vs v2 Multi-Agents</div>',
-                unsafe_allow_html=True)
-
-    if not equity_df.empty and "equity" in equity_df.columns:
-        df_plot = equity_df[["equity"]].copy()
-        # Normaliser à base 100
-        df_plot["equity_norm"] = df_plot["equity"] / df_plot["equity"].iloc[0] * 100
-
-        _plot_line(df_plot.index, df_plot["equity_norm"], "Equity (base 100)", height=400)
-
-        # Métriques
+    # ──────────────────────────────────────────────────────────────────────────
+    # SECTION : Risque
+    # ──────────────────────────────────────────────────────────────────────────
+    elif "Risque" in (section or ""):
         metrics = compute_equity_metrics(equity_df, window=2000)
-        eq_s    = equity_df["equity"].dropna()
-        total_ret = (eq_s.iloc[-1] / eq_s.iloc[0] - 1) * 100 if len(eq_s) > 1 else np.nan
+        var95   = compute_var_cvar(equity_df, alpha=0.05, window=var_window, horizon_steps=var_horizon)
+        var99   = compute_var_cvar(equity_df, alpha=0.01, window=var_window, horizon_steps=var_horizon)
 
-        with st.container(border=True):
-            cc1, cc2, cc3, cc4 = st.columns(4)
-            cc1.metric("Retour total",   f"{total_ret:+.2f}%" if np.isfinite(total_ret) else "—")
-            cc2.metric("Sharpe",         _human_num(metrics.get("sharpe", np.nan), 2))
-            cc3.metric("Max Drawdown",   _human_pct(metrics.get("max_drawdown", np.nan), 2))
-            cc4.metric("Ann. Vol",       _human_pct(metrics.get("ann_vol", np.nan), 2))
+        # Drawdown progress bar
+        dd_progress = html.Div()
+        if not equity_df.empty and "equity" in equity_df.columns:
+            eq_s = equity_df["equity"].dropna()
+            if len(eq_s) > 0:
+                peak    = eq_s.cummax()
+                dd_cur  = float(((eq_s - peak) / peak).iloc[-1] * 100)
+                ks_thr  = 3.0
+                prog    = min(100, abs(dd_cur) / ks_thr * 100)
+                dd_progress = dbc.Progress(
+                    value=prog,
+                    label=f"DD courant: {dd_cur:.2f}% | Kill-switch à −{ks_thr:.0f}%",
+                    color="danger" if prog > 80 else "warning" if prog > 50 else "success",
+                    style={"height": "22px"}, className="mb-3",
+                )
+
+        # Correlation heatmap
+        corr = compute_correlation_matrix(mids_df, window=corr_window)
+        corr_fig = _fig_heatmap(corr, "Corr(returns)", height=500)
+
+        # Portfolio variance
+        w_last = _pick_last_weights(weights_df)
+        port   = compute_portfolio_var_from_weights(mids_df, weights_last=w_last, window=corr_window)
+
+        content = html.Div([
+            html.H6("⚠️ Risk Management", style={"color": "#7289da", "letterSpacing": "1px"}),
+            dbc.Row([
+                _kpi("Ann. Return", _human_pct(metrics.get("ann_return"))),
+                _kpi("Ann. Vol",    _human_pct(metrics.get("ann_vol"))),
+                _kpi("Sharpe",      _human_num(metrics.get("sharpe"))),
+                _kpi("Max DD",      _human_pct(metrics.get("max_drawdown"))),
+                _kpi("VaR 95%",     _human_pct(var95.get("var_95"))),
+                _kpi("CVaR 95%",    _human_pct(var95.get("cvar_95"))),
+            ], className="mb-3 g-2"),
+            dd_progress,
+            html.H6("Correlation matrix", style={"fontSize": "12px", "color": "#aaa"}),
+            dcc.Graph(figure=corr_fig, config={"displayModeBar": False}),
+            html.Hr(style={"borderColor": "#1e1e30"}),
+            html.H6("Portfolio variance (weights × cov)",
+                    style={"fontSize": "12px", "color": "#aaa"}),
+            dbc.Row([
+                _kpi("Port vol/step", _human_num(port.get("port_vol_step"), 6)),
+                _kpi("Port var/step", _human_num(port.get("port_var_step"), 10)),
+                _kpi("#assets",       str(int(port.get("n_assets", 0)))),
+            ], className="g-2"),
+        ])
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SECTION : Régime
+    # ──────────────────────────────────────────────────────────────────────────
+    elif "Régime" in (section or ""):
+        ag_regime = state.get("agents", {}).get("RegimeAgent", {})
+        ag_sent   = state.get("agents", {}).get("SentimentAgent", {})
+        regime    = ag_regime.get("current_regime", "unknown")
+        qt        = ag_regime.get("current_qt", 0.5)
+
+        _regime_desc = {
+            "mean_reverting" : ("🟢 Mean Reverting",  "info",   "Conditions idéales pour stat-arb. Q_t = 1.0"),
+            "carry_favorable": ("🟢 Carry Favorable",  "success","Funding stable et élevé. Boost overlay carry."),
+            "trending"       : ("🟡 Trending",          "warning","Momentum fort. Exposition réduite. Q_t = 0.3"),
+            "high_vol"       : ("🔴 High Vol",          "danger", "Vol BTC > p90. Stratégie stoppée. Q_t = 0.0"),
+            "crisis"         : ("🚨 CRISIS",            "danger", "Liquidations massives. Kill-switch activé."),
+            "unknown"        : ("⚪ Unknown",            "secondary","Données insuffisantes pour classifier."),
+        }
+        label, color_r, desc = _regime_desc.get(regime, ("⚪ Unknown", "secondary", ""))
+
+        comp_df = pd.DataFrame({
+            "Composante"  : ["Volatilité", "Momentum", "Liquidations", "Funding"],
+            "Score"       : [ag_regime.get("vol_score", 0), ag_regime.get("momentum_score", 0),
+                             ag_regime.get("liq_score", 0), ag_regime.get("funding_score", 0)],
+            "Poids"       : [0.35, 0.40, 0.15, 0.10],
+        })
+        comp_df["Contribution"] = comp_df["Score"] * comp_df["Poids"]
+
+        content = html.Div([
+            html.H6("🌊 Régime de Marché", style={"color": "#7289da", "letterSpacing": "1px"}),
+            dbc.Alert([html.H5(label, className="mb-1"), html.Small(desc)], color=color_r,
+                      className="p-3 mb-3"),
+            dbc.Row([
+                _kpi("Q_t appliqué",  f"{qt:.1f}"),
+                _kpi("Fear & Greed",  f"{ag_sent.get('fg_raw', 50)} / 100"),
+                _kpi("Vol Score",     f"{ag_regime.get('vol_score', 0):.3f}"),
+                _kpi("Momentum",      f"{ag_regime.get('momentum_score', 0):.3f}"),
+            ], className="mb-3 g-2"),
+            html.H6("Composantes du score régime",
+                    style={"fontSize": "12px", "color": "#aaa"}),
+            dbc.Table.from_dataframe(comp_df.round(4), dark=True, hover=True, size="sm"),
+        ])
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SECTION : Prédictions ML
+    # ──────────────────────────────────────────────────────────────────────────
+    elif "Prédictions" in (section or ""):
+        probas = state.get("predictions", {})
+        if probas:
+            rows_pred = []
+            for sym, p in sorted(probas.items(), key=lambda x: -x[1]):
+                direction = "🟢 BULLISH" if p > 0.55 else "🔴 BEARISH" if p < 0.45 else "⚪ NEUTRAL"
+                rows_pred.append({
+                    "Symbole": sym,
+                    "P(hausse)": f"{p:.3f}",
+                    "Score": f"{2*(p-0.5):+.3f}",
+                    "Signal": direction,
+                })
+            pred_table = dbc.Table.from_dataframe(
+                pd.DataFrame(rows_pred), dark=True, hover=True, size="sm", striped=True,
+            )
+        else:
+            pred_table = dbc.Alert("Pas de prédictions disponibles dans state.json.",
+                                   color="secondary")
+        content = html.Div([
+            html.H6("🔮 Prédictions ML — PredictionAgent",
+                    style={"color": "#7289da", "letterSpacing": "1px"}),
+            dbc.Alert("P > 0.55 → haussier | P < 0.45 → baissier",
+                      color="dark", className="p-2 mb-3", style={"fontSize": "11px"}),
+            pred_table,
+        ])
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SECTION : Equity Curves
+    # ──────────────────────────────────────────────────────────────────────────
+    elif "Equity Curves" in (section or ""):
+        if not equity_df.empty and "equity" in equity_df.columns:
+            eq_s = equity_df["equity"].dropna()
+            eq_norm = eq_s / eq_s.iloc[0] * 100 if len(eq_s) > 0 else eq_s
+            eq_fig  = _fig_line(equity_df.index, eq_norm, "Equity (base 100)", height=400)
+            metrics = compute_equity_metrics(equity_df, window=2000)
+            total_ret = (eq_s.iloc[-1] / eq_s.iloc[0] - 1) * 100 if len(eq_s) > 1 else float("nan")
+            kpi_row = dbc.Row([
+                _kpi("Retour total", f"{total_ret:+.2f}%" if np.isfinite(total_ret) else "—"),
+                _kpi("Sharpe",       _human_num(metrics.get("sharpe"))),
+                _kpi("Max Drawdown", _human_pct(metrics.get("max_drawdown"))),
+                _kpi("Ann. Vol",     _human_pct(metrics.get("ann_vol"))),
+            ], className="mt-3 g-2")
+        else:
+            eq_fig  = _empty_fig(400, "Lancer backtest ou paper trading pour avoir equity.csv")
+            kpi_row = html.Div()
+
+        content = html.Div([
+            html.H6("📊 Equity Curve", style={"color": "#7289da", "letterSpacing": "1px"}),
+            dcc.Graph(figure=eq_fig, config={"displayModeBar": False}),
+            kpi_row,
+        ])
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # SECTION : Raw Tables
+    # ──────────────────────────────────────────────────────────────────────────
+    elif "Raw Tables" in (section or ""):
+        content = html.Div([
+            html.H6("🔢 Raw Tables", style={"color": "#7289da", "letterSpacing": "1px"}),
+            html.H6("equity.csv (tail)", style={"fontSize": "12px", "color": "#aaa"}),
+            dbc.Table.from_dataframe(
+                equity_df.tail(500), dark=True, hover=True, size="sm", striped=True,
+            ) if not equity_df.empty else dbc.Alert("Vide", color="dark"),
+            html.H6("mids.csv (tail)", style={"fontSize": "12px", "color": "#aaa", "marginTop": "12px"}),
+            dbc.Table.from_dataframe(
+                mids_df.tail(500), dark=True, hover=True, size="sm", striped=True,
+            ) if not mids_df.empty else dbc.Alert("Vide", color="dark"),
+            html.H6("weights.csv (tail)", style={"fontSize": "12px", "color": "#aaa", "marginTop": "12px"}),
+            dbc.Table.from_dataframe(
+                weights_df.tail(500), dark=True, hover=True, size="sm", striped=True,
+            ) if not weights_df.empty else dbc.Alert("Vide", color="dark"),
+        ])
+
     else:
-        st.info("Données equity non disponibles. Lance le backtest ou le paper trading d'abord.")
+        content = dbc.Alert("Sélectionne une section dans le sidebar.", color="dark")
+
+    # ── Raw tables toggle (any section) ──────────────────────────────────────
+    if "show" in (show_raw or []) and "Raw Tables" not in (section or ""):
+        raw_section = html.Div([
+            html.Hr(style={"borderColor": "#1e1e30"}),
+            html.H6("🔢 Raw — equity.csv",  style={"fontSize": "12px", "color": "#aaa"}),
+            dbc.Table.from_dataframe(equity_df.tail(500), dark=True, hover=True,
+                                     size="sm") if not equity_df.empty else html.Div(),
+        ])
+    else:
+        raw_section = html.Div()
+
+    return hdr_exch, hdr_snap, ks_banner, content, raw_section
+
+
+@app.callback(
+    Output("btn-flat-all", "children"),
+    Input("btn-flat-all", "n_clicks"),
+    prevent_initial_call=True,
+)
+def flat_all(_n):
+    return "⚠️ Non implémenté en démo"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION : RAW TABLES
+# MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-elif "Raw Tables" in section or show_raw:
-    st.markdown('<div class="section-header">🔢 Raw Tables</div>', unsafe_allow_html=True)
-    st.subheader("equity.csv (tail)")
-    st.dataframe(equity_df.tail(2000), use_container_width=True)
-    st.subheader("mids.csv (tail)")
-    st.dataframe(mids_df.tail(2000), use_container_width=True)
-    st.subheader("weights.csv (tail)")
-    st.dataframe(weights_df.tail(2000), use_container_width=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Show raw si checkbox cochée (depuis n'importe quelle section)
-# ─────────────────────────────────────────────────────────────────────────────
-if show_raw and "Raw Tables" not in section:
-    st.divider()
-    st.subheader("Raw — equity.csv (tail)")
-    st.dataframe(equity_df.tail(2000), use_container_width=True)
-    st.subheader("Raw — mids.csv (tail)")
-    st.dataframe(mids_df.tail(2000), use_container_width=True)
-    st.subheader("Raw — weights.csv (tail)")
-    st.dataframe(weights_df.tail(2000), use_container_width=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-REFRESH (st.rerun = delta WebSocket, pas de rechargement navigateur)
-# ─────────────────────────────────────────────────────────────────────────────
-if auto_refresh:
-    time.sleep(int(refresh_s))
-    st.rerun()
+if __name__ == "__main__":
+    app.run(debug=False, host="0.0.0.0", port=8051)
